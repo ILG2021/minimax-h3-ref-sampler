@@ -135,14 +135,16 @@ def _make_fixed_audio_sampler(
 
     def sample_fixed_audio(model_wrap, x, sigmas, extra_args=None, callback=None,
                            disable=None):
-        if x.ndim != 2 or x.shape[-1] != packed_values:
+        # ComfyUI's pack_latents() contract is [B, 1, packed_values]. Keep
+        # this singleton axis: unpack_latents() requires it after sampling.
+        if x.ndim != 3 or x.shape[1] != 1 or x.shape[-1] != packed_values:
             raise ValueError(
-                f"packed H3 latent mismatch: expected [B,{packed_values}], "
+                f"packed H3 latent mismatch: expected [B,1,{packed_values}], "
                 f"got {tuple(x.shape)}"
             )
         args = {} if extra_args is None else extra_args
-        clean = clean_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], -1)
-        noise = noise_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], -1)
+        clean = clean_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], 1, -1)
+        noise = noise_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], 1, -1)
         sigma_batch = x.new_ones([x.shape[0]])
         video = x[..., :video_values]
 
