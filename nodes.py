@@ -124,14 +124,22 @@ def _patch_h3_model(model, sampling, video_shift: float, audio_shift: float):
 def _make_fixed_audio_sampler(
     clean_audio: torch.Tensor,
     audio_noise: torch.Tensor,
+    video_noise: torch.Tensor | None,
     video_values: int,
     video_shift: float,
     audio_shift: float,
+    video_mask_p: torch.Tensor | None,
+    target_latent_p: torch.Tensor | None,
 ):
     """Build Euler sampler that integrates video only and reconstructs audio."""
     packed_values = video_values + math.prod(clean_audio.shape[1:])
     clean_cpu = clean_audio.detach().to(device="cpu", dtype=torch.float32)
     noise_cpu = audio_noise.detach().to(device="cpu", dtype=torch.float32)
+    video_noise_cpu = None
+    if video_noise is not None:
+        video_noise_cpu = video_noise.detach().to(
+            device="cpu", dtype=torch.float32
+        )
 
     def sample_fixed_audio(model_wrap, x, sigmas, extra_args=None, callback=None,
                            disable=None):
@@ -145,8 +153,35 @@ def _make_fixed_audio_sampler(
         args = {} if extra_args is None else extra_args
         clean = clean_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], 1, -1)
         noise = noise_cpu.to(device=x.device, dtype=x.dtype).reshape(x.shape[0], 1, -1)
+
         sigma_batch = x.new_ones([x.shape[0]])
-        video = x[..., :video_values]
+        video = x[..., :video_values]  # pure noise video
+
+        video_mask = None
+        target_latent = None
+        target_noise = None
+        if video_mask_p is not None and target_latent_p is not None:
+            video_mask = video_mask_p.to(
+                device=x.device, dtype=x.dtype
+            ).reshape(x.shape[0], 1, -1)
+            target_latent = target_latent_p.to(
+                device=x.device, dtype=x.dtype
+            ).reshape(x.shape[0], 1, -1)
+            if video_noise_cpu is None:
+                raise ValueError("video noise is required for video repaint")
+            target_noise = video_noise_cpu.to(
+                device=x.device, dtype=x.dtype
+            ).reshape(x.shape[0], 1, -1)
+            if video_mask.shape[-1] != video_values:
+                raise ValueError(
+                    "video mask packed size mismatch: "
+                    f"expected {video_values}, got {video_mask.shape[-1]}"
+                )
+            target_noisy = (
+                (1.0 - sigmas[0]) * target_latent
+                + sigmas[0] * target_noise
+            )
+            video = video * video_mask + target_noisy * (1.0 - video_mask)
 
         for step in comfy.utils.model_trange(len(sigmas) - 1, disable=disable):
             sigma_v = sigmas[step]
@@ -164,7 +199,15 @@ def _make_fixed_audio_sampler(
 
             # Integrate only target video on the outer video clock.
             video = video + derivative[..., :video_values] * (sigma_v_next - sigma_v)
-
+            if video_mask is not None and target_latent is not None:
+                target_noisy = (
+                    (1.0 - sigma_v_next) * target_latent
+                    + sigma_v_next * target_noise
+                )
+                video = (
+                    video * video_mask
+                    + (1.0 - video_mask) * target_noisy
+                )
             # The model's audio prediction is deliberately ignored. Build the
             # exact next audio state from a0, epsilon_a and sigma_audio(next).
             audio_next = (1.0 - sigma_a_next) * clean + sigma_a_next * noise
@@ -189,6 +232,67 @@ def _make_fixed_audio_sampler(
     return comfy.samplers.KSAMPLER(sample_fixed_audio)
 
 
+def _make_video_mask_only_sampler(
+    video_values: int,
+    video_mask: torch.Tensor,
+    target_latent: torch.Tensor,
+    video_noise: torch.Tensor,
+):
+    """Build a standard Euler sampler with a sigma-consistent video mask."""
+    mask_cpu = video_mask.detach().to(device="cpu", dtype=torch.float32)
+    target_cpu = target_latent.detach().to(device="cpu", dtype=torch.float32)
+    noise_cpu = video_noise.detach().to(device="cpu", dtype=torch.float32)
+
+    def sample_masked(model_wrap, x, sigmas, extra_args=None, callback=None,
+                      disable=None):
+        if x.ndim != 3 or x.shape[1] != 1 or x.shape[-1] <= video_values:
+            raise ValueError(
+                "expected packed H3 AV latent [B,1,video+audio], got "
+                f"{tuple(x.shape)}"
+            )
+        args = {} if extra_args is None else extra_args
+        mask = mask_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        target = target_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        noise = noise_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        if not (mask.shape[-1] == target.shape[-1] == noise.shape[-1]
+                == video_values):
+            raise ValueError("masked video tensors do not match packed video size")
+        sigma_batch = x.new_ones([x.shape[0]])
+
+        target_noisy = (1.0 - sigmas[0]) * target + sigmas[0] * noise
+        x = torch.cat((
+            x[..., :video_values] * mask + target_noisy * (1.0 - mask),
+            x[..., video_values:],
+        ), dim=-1)
+
+        for step in comfy.utils.model_trange(len(sigmas) - 1, disable=disable):
+            sigma = sigmas[step]
+            sigma_next = sigmas[step + 1]
+            denoised = model_wrap(x, sigma * sigma_batch, **args)
+            x = x + to_d(x, sigma, denoised) * (sigma_next - sigma)
+
+            target_noisy = (
+                (1.0 - sigma_next) * target + sigma_next * noise
+            )
+            video = (
+                x[..., :video_values] * mask
+                + target_noisy * (1.0 - mask)
+            )
+            x = torch.cat((video, x[..., video_values:]), dim=-1)
+            if callback is not None:
+                callback({
+                    "x": x,
+                    "i": step,
+                    "sigma": sigma,
+                    "sigma_hat": sigma,
+                    "denoised": denoised,
+                })
+        return x
+
+    sample_masked.__name__ = "sample_minimax_h3_masked_euler"
+    return comfy.samplers.KSAMPLER(sample_masked)
+
+
 class _BasicPositiveGuider(comfy.samplers.CFGGuider):
     """Same one-condition setup used by ComfyUI's Basic Guider node."""
 
@@ -206,8 +310,6 @@ class MinimaxH3RefSampler:
                 "model": ("MODEL",),
                 "positive": ("CONDITIONING",),
                 "latent": ("LATENT",),
-                "audio_vae": ("VAE",),
-                "target_audio": ("AUDIO",),
                 "seed": ("INT", {
                     "default": 0,
                     "min": 0,
@@ -222,41 +324,125 @@ class MinimaxH3RefSampler:
                 "shift_audio": ("FLOAT", {
                     "default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01,
                 }),
+            },
+            "optional":{
+                "audio_vae": ("VAE",),
+                "target_audio": ("AUDIO",),
+                "video_vae": ("VAE",),
+                "video_mask": ("MASK",),
+                "target_video": ("IMAGE",),
             }
         }
 
     RETURN_TYPES = ("LATENT", "AUDIO")
-    RETURN_NAMES = ("samples", "original_audio")
+    RETURN_NAMES = ("samples", "aligned_audio")
     FUNCTION = "sample"
     CATEGORY = "sampling/minimax"
 
-    def sample(self, model, positive, latent, audio_vae, target_audio, seed,
-               steps, scheduler, shift_video, shift_audio):
-        video, audio_template = _av_parts(latent)
+    def sample(self, model, positive, latent, seed, steps, scheduler,
+               shift_video, shift_audio, audio_vae=None, target_audio=None,
+               video_vae=None, video_mask=None, target_video=None):
+        video, audio_template = _av_parts(latent) # video: [B, 24, T, H, W] audio: [B, 32, 2, T]
         if video.shape[0] != 1:
             raise ValueError("MiniMax H3 Ref Sampler supports batch size 1")
 
-        waveform, sample_rate = _validate_audio(target_audio)
-        vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
-        if sample_rate != vae_rate:
-            waveform = torchaudio.functional.resample(
-                waveform, sample_rate, vae_rate
+        if (audio_vae is None) != (target_audio is None):
+            raise ValueError(
+                "audio_vae and target_audio must either both be connected or both omitted"
             )
-        clean_audio = audio_vae.encode(waveform.movedim(1, -1))
-        clean_audio = _fit_audio_latent(clean_audio, audio_template)
+        clean_audio = None
+        aligned_audio = None
+        if target_audio is not None:
+            waveform, sample_rate = _validate_audio(target_audio)
+            vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+            if sample_rate != vae_rate:
+                waveform = torchaudio.functional.resample(
+                    waveform, sample_rate, vae_rate
+                )
+            clean_audio = audio_vae.encode(waveform.movedim(1, -1))
+            source_audio_t = clean_audio.shape[-1]
+            clean_audio = _fit_audio_latent(clean_audio, audio_template)
+            target_samples = max(1, round(
+                waveform.shape[-1] * audio_template.shape[-1] / source_audio_t
+            ))
+            aligned_waveform = waveform[..., :target_samples]
+            if aligned_waveform.shape[-1] < target_samples:
+                aligned_waveform = torch.nn.functional.pad(
+                    aligned_waveform,
+                    (0, target_samples - aligned_waveform.shape[-1]),
+                )
+            aligned_audio = dict(target_audio)
+            aligned_audio["waveform"] = aligned_waveform
+            aligned_audio["sample_rate"] = vae_rate
+        target_latent = None
+        if (video_mask is None) != (target_video is None):
+            raise ValueError(
+                "video_mask and target_video must either both be connected or both omitted"
+            )
+        if video_mask is not None:
+            if video_vae is None:
+                raise ValueError("video_vae is required when using video repaint")
+            # H3 FaceRefine conversion: IMAGE batches are video frames
+            # [T,H,W,C]. Encode RGB, then convert [T,C,H,W] to H3's
+            # [B,C,T,H,W] layout when the VAE returns a 4D tensor.
+            target_latent = video_vae.encode(target_video[..., :3])
+            if target_latent.ndim == 4:
+                target_latent = target_latent.unsqueeze(0).movedim(1, 2)
+            if target_latent.ndim != 5:
+                raise ValueError(
+                    "Video VAE must return [B,C,T,H,W] (or [T,C,H,W]), got "
+                    f"{tuple(target_latent.shape)}"
+                )
+            if tuple(target_latent.shape) != tuple(video.shape):
+                raise ValueError(
+                    "target video latent must match the H3 target layout: "
+                    f"target={tuple(target_latent.shape)}, H3={tuple(video.shape)}"
+                )
+
+            # MASK is a frame batch [T,H,W]. Keep it independent from the
+            # VAE, resize it to latent T/H/W, then expand it across all H3
+            # video channels so its packed order matches the video latent.
+            video_mask = video_mask.float()
+            if video_mask.ndim == 2:
+                video_mask = video_mask.unsqueeze(0)
+            if video_mask.ndim == 3:
+                video_mask = video_mask.unsqueeze(0).unsqueeze(0)
+            elif video_mask.ndim == 4:
+                video_mask = video_mask.unsqueeze(1)
+            else:
+                raise ValueError(
+                    "video_mask must be [T,H,W] or [B,T,H,W], got "
+                    f"{tuple(video_mask.shape)}"
+                )
+            if video_mask.shape[0] != video.shape[0]:
+                raise ValueError("video mask batch size differs from H3 video batch")
+            video_mask = torch.nn.functional.interpolate(
+                video_mask,
+                size=video.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            ).clamp(0.0, 1.0)
+            video_mask = video_mask.expand(
+                video.shape[0], video.shape[1], *video.shape[2:]
+            )
 
         # Do not pass an inherited inpaint mask into model_wrap. Its generic
         # video-clock blending could overwrite sigma-consistent target audio.
         prepared = dict(latent)
         prepared.pop("noise_mask", None)
         prepared["samples"] = comfy.nested_tensor.NestedTensor(
-            (video, clean_audio)
+            (video, clean_audio if clean_audio is not None else audio_template)
         )
 
-        sampling = _make_model_sampling(model, shift_video)
-        patched_model = _patch_h3_model(
-            model, sampling, shift_video, shift_audio
-        )
+        fixed_audio = clean_audio is not None
+        if fixed_audio:
+            sampling = _make_model_sampling(model, shift_video)
+            sampling_model = _patch_h3_model(
+                model, sampling, shift_video, shift_audio
+            )
+        else:
+            sampling = model.get_model_object("model_sampling")
+            sampling_model = model
         sigmas = comfy.samplers.calculate_sigmas(
             sampling, scheduler, int(steps)
         ).cpu()
@@ -267,26 +453,49 @@ class MinimaxH3RefSampler:
         ):
             raise ValueError("scheduler must return at least two sigmas ending at zero")
 
-        # Dedicated fixed audio epsilon_a. It is generated once and reused for
-        # every step. Video noise is generated by ComfyUI below with the seed.
-        generator = torch.Generator(device="cpu").manual_seed(int(seed))
-        audio_noise = torch.randn(
-            clean_audio.shape, generator=generator, dtype=torch.float32
-        )
-        audio_noise *= float(getattr(sampling, "noise_scale", 1.0))
-        sampler = _make_fixed_audio_sampler(
-            clean_audio,
-            audio_noise,
-            math.prod(video.shape[1:]),
-            shift_video,
-            shift_audio,
-        )
-
         latent_samples = prepared["samples"]
         noise = comfy.sample.prepare_noise(
             latent_samples, int(seed), prepared.get("batch_index")
         )
-        guider = _BasicPositiveGuider(patched_model)
+        video_noise = None
+        if video_mask is not None:
+            if not getattr(noise, "is_nested", False):
+                raise ValueError("expected nested H3 noise for video repaint")
+            noise_parts = tuple(noise.unbind())
+            if len(noise_parts) != 2:
+                raise ValueError("expected video/audio H3 noise components")
+            video_noise = noise_parts[0] * float(
+                getattr(sampling, "noise_scale", 1.0)
+            )
+        if fixed_audio:
+            # Dedicated fixed audio epsilon_a, generated once and reused.
+            generator = torch.Generator(device="cpu").manual_seed(int(seed))
+            audio_noise = torch.randn(
+                clean_audio.shape, generator=generator, dtype=torch.float32
+            )
+            audio_noise *= float(getattr(sampling, "noise_scale", 1.0))
+            sampler = _make_fixed_audio_sampler(
+                clean_audio,
+                audio_noise,
+                video_noise,
+                math.prod(video.shape[1:]),
+                shift_video,
+                shift_audio,
+                video_mask,
+                target_latent,
+            )
+        elif video_mask is not None:
+            sampler = _make_video_mask_only_sampler(
+                math.prod(video.shape[1:]),
+                video_mask,
+                target_latent,
+                video_noise,
+            )
+        else:
+            # No optional feature is active: use ComfyUI's stock Euler path.
+            sampler = comfy.samplers.sampler_object("euler")
+
+        guider = _BasicPositiveGuider(sampling_model)
         guider.set_positive(positive)
         samples = guider.sample(
             noise,
@@ -301,7 +510,7 @@ class MinimaxH3RefSampler:
 
         output = prepared.copy()
         output["samples"] = samples
-        return output, target_audio
+        return output, aligned_audio
 
 
 NODE_CLASS_MAPPINGS = {
