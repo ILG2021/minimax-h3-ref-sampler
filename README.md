@@ -112,6 +112,30 @@ The node is located under:
 sampling/minimax
 ```
 
+## Long videos
+
+`Minimax H3 Ref Sampler` automatically switches to sequential overlapping
+windows when `target_audio` is longer than the connected native H3 latent.
+For long-form work, supply a maximum trained window (362 aligned frames, about
+15 seconds). No separate long-video node or external loop is required.
+
+The first window is sampled normally. Every later window pins the previous
+window's tail in latent space, generates the remaining area, and discards the
+duplicated head before concatenation. The default `context_frames=22` carries
+about 0.92 seconds of motion without a Video-VAE decode/encode round trip.
+When repaint inputs are connected, repaint is applied to the first window;
+later windows continue from that result through the same latent overlap.
+
+Supported continuation spans are `5`, `22`, `39`, and `56` frames because they
+land exactly on H3's temporal latent grid. Each window uses `seed + window_index`.
+The original target waveform is returned for final muxing; window audio is cut
+against one absolute 40 Hz latent timeline.
+
+For inputs no longer than one window, the node performs one sampling pass.
+The output is a combined AV latent, so decoding an extremely long result can
+still require substantial host/GPU memory even though sampling remains
+window-sized.
+
 ## Inputs
 
 | Input | Type | Recommended source | Description |
@@ -246,17 +270,15 @@ target diffusion trajectory and drives the generated mouth motion.
 
 ## Audio duration behavior
 
-The target audio latent is aligned to the duration defined by the input H3 AV
-latent:
+The input H3 AV latent defines one sampling-window duration:
 
-- longer target audio is cropped at the latent boundary;
+- longer target audio automatically activates overlapping window generation;
 - shorter target audio is zero-padded in latent space;
 - `original_audio` itself is returned unchanged.
 
-For clean final muxing, crop/pad the waveform to the intended video duration
-before this node. Otherwise the generated video duration and the untouched
-`original_audio` duration may differ, and the final combine node will decide
-whether to trim, pad, or extend the container.
+H3 video frames must land on its `5 + 17*n` temporal grid. The final generated
+picture can therefore extend slightly beyond an arbitrary waveform duration;
+the untouched `original_audio` remains the mux source.
 
 ## Recommended starting settings
 

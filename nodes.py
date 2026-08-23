@@ -14,6 +14,32 @@ import comfy.samplers
 import comfy.utils
 from comfy.k_diffusion.sampling import to_d
 
+H3_VIDEO_FPS = 24
+H3_AUDIO_LATENT_FPS = 40
+
+
+def _video_latent_steps(frame_count: int) -> int:
+    """Native H3 temporal VAE size for a supported 5 + 17*n frame run."""
+    if frame_count < 5 or frame_count % 17 != 5:
+        raise ValueError("H3 frame count must be 5 + 17*n")
+    return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
+
+
+def _context_latent_steps(frame_count: int) -> int:
+    """Latent steps occupied by one exact H3 continuation span."""
+    return _video_latent_steps(frame_count)
+
+
+def _video_frames_from_latent_steps(latent_t: int) -> int:
+    if latent_t < 2 or (latent_t - 2) % 5:
+        raise ValueError(f"unexpected H3 video latent length: {latent_t}")
+    return 5 + ((latent_t - 2) // 5) * 17
+
+
+def _align_frame_count(frame_count: int) -> int:
+    frame_count = max(5, int(frame_count))
+    return frame_count + ((5 - frame_count) % 17)
+
 
 def _av_parts(latent: Mapping) -> tuple[torch.Tensor, torch.Tensor]:
     """Validate and split H3 NestedTensor(video, audio)."""
@@ -328,6 +354,7 @@ class MinimaxH3RefSampler:
             "optional":{
                 "audio_vae": ("VAE",),
                 "target_audio": ("AUDIO",),
+                "context_frames": (["5", "22", "39", "56"], {"default": "22"}),
                 "video_vae": ("VAE",),
                 "video_mask": ("MASK",),
                 "target_video": ("IMAGE",),
@@ -335,13 +362,15 @@ class MinimaxH3RefSampler:
         }
 
     RETURN_TYPES = ("LATENT", "AUDIO")
-    RETURN_NAMES = ("samples", "aligned_audio")
+    RETURN_NAMES = ("samples", "original_audio")
     FUNCTION = "sample"
     CATEGORY = "sampling/minimax"
 
     def sample(self, model, positive, latent, seed, steps, scheduler,
                shift_video, shift_audio, audio_vae=None, target_audio=None,
-               video_vae=None, video_mask=None, target_video=None):
+               context_frames="22", video_vae=None, video_mask=None,
+               target_video=None, _context_video_latent=None,
+               _context_frames=0, _single_window=False):
         video, audio_template = _av_parts(latent) # video: [B, 24, T, H, W] audio: [B, 32, 2, T]
         if video.shape[0] != 1:
             raise ValueError("MiniMax H3 Ref Sampler supports batch size 1")
@@ -350,8 +379,19 @@ class MinimaxH3RefSampler:
             raise ValueError(
                 "audio_vae and target_audio must either both be connected or both omitted"
             )
+        if target_audio is not None and not _single_window:
+            waveform, sample_rate = _validate_audio(target_audio)
+            total_audio_t = round(
+                waveform.shape[-1] / sample_rate * H3_AUDIO_LATENT_FPS
+            )
+            if total_audio_t > audio_template.shape[-1]:
+                return self._sample_long(
+                    model, positive, latent, audio_vae, target_audio, seed,
+                    steps, scheduler, shift_video, shift_audio,
+                    context_frames, video_vae, video_mask, target_video,
+                )
         clean_audio = None
-        aligned_audio = None
+        original_audio = None
         if target_audio is not None:
             waveform, sample_rate = _validate_audio(target_audio)
             vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
@@ -360,20 +400,10 @@ class MinimaxH3RefSampler:
                     waveform, sample_rate, vae_rate
                 )
             clean_audio = audio_vae.encode(waveform.movedim(1, -1))
-            source_audio_t = clean_audio.shape[-1]
             clean_audio = _fit_audio_latent(clean_audio, audio_template)
-            target_samples = max(1, round(
-                waveform.shape[-1] * audio_template.shape[-1] / source_audio_t
-            ))
-            aligned_waveform = waveform[..., :target_samples]
-            if aligned_waveform.shape[-1] < target_samples:
-                aligned_waveform = torch.nn.functional.pad(
-                    aligned_waveform,
-                    (0, target_samples - aligned_waveform.shape[-1]),
-                )
-            aligned_audio = dict(target_audio)
-            aligned_audio["waveform"] = aligned_waveform
-            aligned_audio["sample_rate"] = vae_rate
+            # The latent follows the window duration, but the public audio
+            # output is a true bypass: no resample, crop, pad, or VAE round trip.
+            original_audio = dict(target_audio)
         target_latent = None
         if (video_mask is None) != (target_video is None):
             raise ValueError(
@@ -425,6 +455,33 @@ class MinimaxH3RefSampler:
             video_mask = video_mask.expand(
                 video.shape[0], video.shape[1], *video.shape[2:]
             )
+
+        # Private continuation path. It is deliberately separate from the
+        # public repaint sockets: continuation always pins a full head run.
+        if _context_video_latent is not None:
+            if video_mask is not None:
+                raise ValueError("continuation context cannot be combined with repaint")
+            context = _context_video_latent
+            if not isinstance(context, torch.Tensor) or context.ndim != 5:
+                raise ValueError("continuation context must be [B,24,T,H,W]")
+            context_t = _context_latent_steps(int(_context_frames))
+            if context_t >= video.shape[2]:
+                raise ValueError("continuation context must be shorter than the window")
+            expected = (
+                video.shape[0], video.shape[1], context_t,
+                video.shape[3], video.shape[4],
+            )
+            if tuple(context.shape) != tuple(expected):
+                raise ValueError(
+                    "continuation context layout mismatch: "
+                    f"expected {expected}, got {tuple(context.shape)}"
+                )
+            target_latent = torch.zeros_like(video)
+            target_latent[:, :, :context_t] = context.to(
+                device=video.device, dtype=video.dtype
+            )
+            video_mask = torch.ones_like(video)
+            video_mask[:, :, :context_t] = 0.0
 
         # Do not pass an inherited inpaint mask into model_wrap. Its generic
         # video-clock blending could overwrite sigma-consistent target audio.
@@ -510,7 +567,104 @@ class MinimaxH3RefSampler:
 
         output = prepared.copy()
         output["samples"] = samples
-        return output, aligned_audio
+        return output, original_audio
+
+
+    def _sample_long(self, model, positive, latent, audio_vae, target_audio,
+                     seed, steps, scheduler, shift_video, shift_audio,
+                     context_frames, video_vae=None, video_mask=None,
+                     target_video=None):
+        video_template, audio_template = _av_parts(latent)
+        waveform, sample_rate = _validate_audio(target_audio)
+        vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+        if sample_rate != vae_rate:
+            waveform = torchaudio.functional.resample(waveform, sample_rate, vae_rate)
+
+        context_frames = int(context_frames)
+        context_video_t = _context_latent_steps(context_frames)
+        if context_video_t >= video_template.shape[2]:
+            raise ValueError("context is not shorter than the supplied H3 window")
+
+        window_audio_t = int(audio_template.shape[-1])
+        window_video_frames = _video_frames_from_latent_steps(
+            int(video_template.shape[2])
+        )
+        total_audio_t = max(1, round(
+            waveform.shape[-1] / vae_rate * H3_AUDIO_LATENT_FPS
+        ))
+        video_stride_frames = window_video_frames - context_frames
+        if video_stride_frames <= 0:
+            raise ValueError("continuation context is not shorter than window")
+
+        # Derive every audio start from the absolute video-frame position.
+        # 24 fps -> 40 Hz is 5/3, so a fixed rounded audio stride accumulates
+        # drift. Absolute rounding naturally alternates the fractional steps.
+        audio_starts_t = [0]
+        while audio_starts_t[-1] + window_audio_t < total_audio_t:
+            index = len(audio_starts_t)
+            next_start = round(
+                index * video_stride_frames
+                / H3_VIDEO_FPS * H3_AUDIO_LATENT_FPS
+            )
+            if next_start <= audio_starts_t[-1]:
+                raise ValueError("continuation window made no audio progress")
+            audio_starts_t.append(next_start)
+
+        window_samples = max(1, round(
+            window_audio_t / H3_AUDIO_LATENT_FPS * vae_rate
+        ))
+        video_parts, audio_parts = [], []
+        previous_tail = None
+
+        for index, start_audio_t in enumerate(audio_starts_t):
+            start_sample = round(
+                start_audio_t / H3_AUDIO_LATENT_FPS * vae_rate
+            )
+            chunk = waveform[..., start_sample:start_sample + window_samples]
+            chunk_audio = {"waveform": chunk, "sample_rate": vae_rate}
+            sampled, _ = self.sample(
+                model, positive, latent,
+                (int(seed) + index) & 0xFFFFFFFFFFFFFFFF,
+                steps, scheduler,
+                shift_video, shift_audio, audio_vae=audio_vae,
+                target_audio=chunk_audio,
+                video_vae=video_vae if index == 0 else None,
+                video_mask=video_mask if index == 0 else None,
+                target_video=target_video if index == 0 else None,
+                _context_video_latent=previous_tail,
+                _context_frames=context_frames if previous_tail is not None else 0,
+                _single_window=True,
+            )
+            window_video, window_audio = _av_parts(sampled)
+            if index == 0:
+                video_parts.append(window_video)
+                audio_parts.append(window_audio)
+            else:
+                video_parts.append(window_video[:, :, context_video_t:])
+                audio_stride_t = start_audio_t - audio_starts_t[index - 1]
+                overlap_audio_t = window_audio_t - audio_stride_t
+                if not 0 <= overlap_audio_t < window_audio_t:
+                    raise ValueError("invalid audio overlap for continuation window")
+                audio_parts.append(window_audio[..., overlap_audio_t:])
+            previous_tail = window_video[:, :, -context_video_t:].detach().clone()
+
+        out_video = torch.cat(video_parts, dim=2)
+        wanted_frames = _align_frame_count(round(
+            waveform.shape[-1] / vae_rate * H3_VIDEO_FPS
+        ))
+        if wanted_frames <= window_video_frames:
+            wanted_video_t = _video_latent_steps(wanted_frames)
+        else:
+            extra_frames = wanted_frames - window_video_frames
+            wanted_video_t = int(video_template.shape[2]) + math.ceil(
+                extra_frames / 17
+            ) * 5
+        out_video = out_video[:, :, :wanted_video_t]
+        out_audio = torch.cat(audio_parts, dim=-1)[..., :total_audio_t]
+        output = dict(latent)
+        output.pop("noise_mask", None)
+        output["samples"] = comfy.nested_tensor.NestedTensor((out_video, out_audio))
+        return output, dict(target_audio)
 
 
 NODE_CLASS_MAPPINGS = {
