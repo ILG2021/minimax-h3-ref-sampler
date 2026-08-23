@@ -68,7 +68,9 @@ of sampling another full 362 frames and discarding most of it.
 Reference images remain static. Reference videos, reference audios, and
 video-associated reference audios are treated as full-timeline media and are
 cut at each window's absolute start. Short media is padded: audio with silence,
-video by holding its final frame.
+video by holding its final frame. Reference audio is downmixed to mono before
+official reference encoding. This does not change `target_audio`, whose original
+channel layout is returned unchanged through `original_audio`.
 
 ## Inputs
 

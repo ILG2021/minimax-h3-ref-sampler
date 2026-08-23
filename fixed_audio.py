@@ -391,8 +391,10 @@ class _FixedAudioWindowSampler:
 
 
 def _slice_audio_window(audio: Mapping, start_frame: int, frame_count: int) -> dict:
-    """Cut one 24-fps timeline window and zero-pad its tail."""
+    """Cut a mono reference-audio window and zero-pad its tail."""
     waveform, sample_rate = _validate_audio(audio)
+    if waveform.shape[1] != 1:
+        waveform = waveform.mean(dim=1, keepdim=True)
     start = round(int(start_frame) / H3_VIDEO_FPS * sample_rate)
     wanted = max(1, round(int(frame_count) / H3_VIDEO_FPS * sample_rate))
     chunk = waveform[..., start:start + wanted]
@@ -426,4 +428,3 @@ def _unpack_official_conditioning(result):
             f"MiniMax H3 Reference to Video returned {type(result)!r}, expected two outputs"
         )
     return values[0], values[1]
-
