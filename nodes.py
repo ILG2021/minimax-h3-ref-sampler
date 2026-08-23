@@ -42,10 +42,10 @@ class MinimaxH3RefSampler:
                 "clip": ("CLIP",),
                 "video_vae": ("VAE",),
                 "audio_vae": ("VAE",),
-                "target_audio": ("AUDIO",),
                 "prompt": ("STRING", {"multiline": True, "default": ""}),
                 "width": ("INT", {"default": 864, "min": 32, "max": 8192, "step": 32}),
                 "height": ("INT", {"default": 480, "min": 32, "max": 8192, "step": 32}),
+                "frames": ("INT", {"default": 362, "min": 5, "max": 999999, "step": 17}),
                 "window_frames": ("INT", {"default": 362, "min": 22, "max": 362, "step": 17}),
                 "context_frames": (["5", "22", "39", "56"], {"default": "22"}),
                 "ref_image_size": (["match", "max"], {"default": "match"}),
@@ -58,17 +58,17 @@ class MinimaxH3RefSampler:
                 "shift_video": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
                 "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
             },
-            "optional": optional,
+            "optional": {"target_audio": ("AUDIO",), **optional},
         }
 
-    RETURN_TYPES = ("LATENT", "AUDIO")
-    RETURN_NAMES = ("samples", "original_audio")
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
     FUNCTION = "run"
     CATEGORY = "sampling/minimax"
 
-    def run(self, model, clip, video_vae, audio_vae, target_audio, prompt,
-            width, height, window_frames, context_frames, ref_image_size,
-            seed, steps, scheduler, shift_video, shift_audio, **refs):
+    def run(self, model, clip, video_vae, audio_vae, prompt, width, height,
+            frames, window_frames, context_frames, ref_image_size, seed, steps,
+            scheduler, shift_video, shift_audio, target_audio=None, **refs):
         try:
             from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
         except ImportError as exc:
@@ -77,27 +77,29 @@ class MinimaxH3RefSampler:
                 "MiniMax H3 nodes"
             ) from exc
 
-        waveform, sample_rate = _validate_audio(target_audio)
-        vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
-        encode_waveform = waveform
-        if sample_rate != vae_rate:
-            encode_waveform = torchaudio.functional.resample(
-                waveform, sample_rate, vae_rate
+        full_clean_audio = None
+        if target_audio is not None:
+            waveform, sample_rate = _validate_audio(target_audio)
+            if waveform.shape[1] != 1:
+                waveform = waveform.mean(dim=1, keepdim=True)
+            vae_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
+            encode_waveform = waveform
+            if sample_rate != vae_rate:
+                encode_waveform = torchaudio.functional.resample(
+                    waveform, sample_rate, vae_rate
+                )
+            full_clean_audio = audio_vae.encode(encode_waveform.movedim(1, -1))
+            if (full_clean_audio.ndim != 4
+                    or full_clean_audio.shape[0] != 1
+                    or full_clean_audio.shape[1:3] != (32, 2)):
+                raise ValueError(
+                    "H3 Audio VAE must encode target_audio as [1,32,2,T], got "
+                    f"{tuple(full_clean_audio.shape)}"
+                )
+            full_clean_audio = full_clean_audio.detach().to(
+                device="cpu", dtype=torch.float32
             )
-        full_clean_audio = audio_vae.encode(encode_waveform.movedim(1, -1))
-        if (full_clean_audio.ndim != 4
-                or full_clean_audio.shape[0] != 1
-                or full_clean_audio.shape[1:3] != (32, 2)):
-            raise ValueError(
-                "H3 Audio VAE must encode target_audio as [1,32,2,T], got "
-                f"{tuple(full_clean_audio.shape)}"
-            )
-        full_clean_audio = full_clean_audio.detach().to(
-            device="cpu", dtype=torch.float32
-        )
-        total_frames = _align_frame_count(round(
-            waveform.shape[-1] / sample_rate * H3_VIDEO_FPS
-        ))
+        total_frames = _align_frame_count(int(frames))
         window_frames = _align_frame_count(min(362, int(window_frames)))
         context_frames = int(context_frames)
         windows = _plan_windows(total_frames, window_frames, context_frames)
@@ -157,7 +159,7 @@ class MinimaxH3RefSampler:
             audio_start_t = round(
                 start_frame / H3_VIDEO_FPS * H3_AUDIO_LATENT_FPS
             )
-            if global_audio_noise is None:
+            if full_clean_audio is not None and global_audio_noise is None:
                 # One absolute noise timeline keeps overlapping target-audio
                 # positions identical across independently seeded video windows.
                 noise_t = max(
@@ -170,14 +172,17 @@ class MinimaxH3RefSampler:
                     generator=generator,
                     dtype=torch.float32,
                 )
-            audio_noise = global_audio_noise[
-                ..., audio_start_t:audio_start_t + window_audio_t
-            ]
-            if audio_noise.shape[-1] != window_audio_t:
-                raise RuntimeError("global fixed-audio noise timeline is too short")
-            clean_audio = full_clean_audio[
-                ..., audio_start_t:audio_start_t + window_audio_t
-            ]
+            audio_noise = None
+            clean_audio = None
+            if full_clean_audio is not None:
+                audio_noise = global_audio_noise[
+                    ..., audio_start_t:audio_start_t + window_audio_t
+                ]
+                if audio_noise.shape[-1] != window_audio_t:
+                    raise RuntimeError("global fixed-audio noise timeline is too short")
+                clean_audio = full_clean_audio[
+                    ..., audio_start_t:audio_start_t + window_audio_t
+                ]
             sampled = sampler.sample(
                 model, positive, latent, clean_audio,
                 (int(seed) + index) & 0xFFFFFFFFFFFFFFFF,
@@ -213,13 +218,13 @@ class MinimaxH3RefSampler:
                 (total_frames - window_frames) / 17
             ) * 5
         total_audio_t = max(1, round(
-            waveform.shape[-1] / sample_rate * H3_AUDIO_LATENT_FPS
+            total_frames / H3_VIDEO_FPS * H3_AUDIO_LATENT_FPS
         ))
         out_audio = torch.cat(audio_parts, dim=-1)[..., :total_audio_t]
         if out_video.shape[2] < wanted_video_t:
             raise RuntimeError("stitched video latent is shorter than the target timeline")
         if out_audio.shape[-1] < total_audio_t:
-            raise RuntimeError("stitched audio latent is shorter than the target audio")
+            raise RuntimeError("stitched audio latent is shorter than the output timeline")
         if output_template is None:
             raise RuntimeError("long-video planner produced no windows")
         output = output_template
@@ -227,7 +232,7 @@ class MinimaxH3RefSampler:
         output["samples"] = comfy.nested_tensor.NestedTensor((
             out_video[:, :, :wanted_video_t], out_audio,
         ))
-        return output, dict(target_audio)
+        return (output,)
 
 
 NODE_CLASS_MAPPINGS = {

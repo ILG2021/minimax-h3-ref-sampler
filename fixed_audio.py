@@ -276,6 +276,48 @@ def _make_fixed_audio_sampler(
     return comfy.samplers.KSAMPLER(sample_fixed_audio)
 
 
+def _make_video_context_sampler(video_values, context_mask_p,
+                                context_latent_p, video_noise_p):
+    """Build Euler sampling that pins only the overlapping video prefix."""
+    mask_cpu = context_mask_p.detach().to(device="cpu", dtype=torch.float32)
+    target_cpu = context_latent_p.detach().to(device="cpu", dtype=torch.float32)
+    noise_cpu = video_noise_p.detach().to(device="cpu", dtype=torch.float32)
+
+    def sample_context(model_wrap, x, sigmas, extra_args=None, callback=None,
+                       disable=None):
+        args = {} if extra_args is None else extra_args
+        mask = mask_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        target = target_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        noise = noise_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
+        if not (mask.shape[-1] == target.shape[-1] == noise.shape[-1]
+                == video_values):
+            raise ValueError("motion-context tensors do not match packed video size")
+        sigma_batch = x.new_ones([x.shape[0]])
+        target_noisy = (1.0 - sigmas[0]) * target + sigmas[0] * noise
+        x = torch.cat((
+            x[..., :video_values] * mask + target_noisy * (1.0 - mask),
+            x[..., video_values:],
+        ), dim=-1)
+        for step in comfy.utils.model_trange(len(sigmas) - 1, disable=disable):
+            sigma = sigmas[step]
+            sigma_next = sigmas[step + 1]
+            denoised = model_wrap(x, sigma * sigma_batch, **args)
+            x = x + to_d(x, sigma, denoised) * (sigma_next - sigma)
+            target_noisy = (1.0 - sigma_next) * target + sigma_next * noise
+            video = (
+                x[..., :video_values] * mask
+                + target_noisy * (1.0 - mask)
+            )
+            x = torch.cat((video, x[..., video_values:]), dim=-1)
+            if callback is not None:
+                callback({"x": x, "i": step, "sigma": sigma,
+                          "sigma_hat": sigma, "denoised": denoised})
+        return x
+
+    sample_context.__name__ = "sample_minimax_h3_video_context_euler"
+    return comfy.samplers.KSAMPLER(sample_context)
+
+
 class _BasicPositiveGuider(comfy.samplers.CFGGuider):
     """Same one-condition setup used by ComfyUI's Basic Guider node."""
 
@@ -288,11 +330,13 @@ class _FixedAudioWindowSampler:
 
     def sample(self, model, positive, latent, clean_audio, seed, steps,
                scheduler, shift_video, shift_audio,
-               audio_noise, context_video_latent=None, context_frames=0):
+               audio_noise=None, context_video_latent=None, context_frames=0):
         video, audio_template = _av_parts(latent)
         if video.shape[0] != 1:
             raise ValueError("MiniMax H3 Ref Sampler supports batch size 1")
-        clean_audio = _fit_audio_latent(clean_audio, audio_template)
+        fixed_audio = clean_audio is not None
+        if fixed_audio:
+            clean_audio = _fit_audio_latent(clean_audio, audio_template)
         context_latent = None
         context_mask = None
 
@@ -324,13 +368,17 @@ class _FixedAudioWindowSampler:
         prepared = dict(latent)
         prepared.pop("noise_mask", None)
         prepared["samples"] = comfy.nested_tensor.NestedTensor(
-            (video, clean_audio)
+            (video, clean_audio if fixed_audio else audio_template)
         )
 
-        sampling = _make_model_sampling(model, shift_video)
-        sampling_model = _patch_h3_model(
-            model, sampling, shift_video, shift_audio
-        )
+        if fixed_audio:
+            sampling = _make_model_sampling(model, shift_video)
+            sampling_model = _patch_h3_model(
+                model, sampling, shift_video, shift_audio
+            )
+        else:
+            sampling = model.get_model_object("model_sampling")
+            sampling_model = model
         sigmas = comfy.samplers.calculate_sigmas(
             sampling, scheduler, int(steps)
         ).cpu()
@@ -355,22 +403,22 @@ class _FixedAudioWindowSampler:
             video_noise = noise_parts[0] * float(
                 getattr(sampling, "noise_scale", 1.0)
             )
-        if tuple(audio_noise.shape) != tuple(clean_audio.shape):
-            raise ValueError(
-                "fixed audio noise does not match the encoded window: "
-                f"noise={tuple(audio_noise.shape)}, audio={tuple(clean_audio.shape)}"
+        if fixed_audio:
+            if audio_noise is None or tuple(audio_noise.shape) != tuple(clean_audio.shape):
+                raise ValueError("fixed audio noise does not match the encoded window")
+            audio_noise = audio_noise * float(getattr(sampling, "noise_scale", 1.0))
+            sampler = _make_fixed_audio_sampler(
+                clean_audio, audio_noise, video_noise,
+                math.prod(video.shape[1:]), shift_video, shift_audio,
+                context_mask, context_latent,
             )
-        audio_noise = audio_noise * float(getattr(sampling, "noise_scale", 1.0))
-        sampler = _make_fixed_audio_sampler(
-            clean_audio,
-            audio_noise,
-            video_noise,
-            math.prod(video.shape[1:]),
-            shift_video,
-            shift_audio,
-            context_mask,
-            context_latent,
-        )
+        elif context_mask is not None:
+            sampler = _make_video_context_sampler(
+                math.prod(video.shape[1:]), context_mask, context_latent,
+                video_noise,
+            )
+        else:
+            sampler = comfy.samplers.sampler_object("euler")
 
         guider = _BasicPositiveGuider(sampling_model)
         guider.set_positive(positive)
