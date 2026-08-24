@@ -23,8 +23,10 @@ component.
   and 3 video-associated reference audios.
 - Uses the `frames` input as the output timeline.
 - Generates at most 362 H3-aligned frames per window.
-- Pins the previous window's video-latent tail into the next window at the
-  current sigma, then removes the duplicated prefix during concatenation.
+- Pins the previous window's video and generated-audio latent tails into the
+  next window at the current sigma, then removes the duplicated prefix during
+  concatenation. With `target_audio`, the fixed global audio timeline is used
+  instead of generated-audio continuation.
 - Slices reference video/audio inputs and optional target audio on the same absolute
   24-fps timeline for every window.
 - When supplied, forces the target audio latent throughout sampling and ignores
@@ -62,6 +64,11 @@ The default `window_frames=362` is about 15 seconds at 24 fps. The default
 `context_frames=22` is about 0.92 seconds. Supported context choices are 5, 22,
 39, and 56 frames. A shortened final window is generated when possible instead
 of sampling another full 362 frames and discarding most of it.
+
+Both overlap streams are sliced using absolute boundaries: video on H3's
+`5 + 17*n` temporal grid and audio by mapping each 24-fps boundary onto the
+40 Hz latent grid. Mapping the start and end independently avoids accumulated
+rounding drift (a 22-frame overlap alternates between 36 and 37 audio steps).
 
 Reference images remain static. Reference videos, reference audios, and
 video-associated reference audios are treated as full-timeline media and are
@@ -132,4 +139,7 @@ The single-timeline implementation uses the long-video planning ideas and
 official-conditioning integration patterns from
 [AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director),
 licensed under Apache-2.0. Fixed-target-audio sampling is implemented in this
-project.
+project. The AV continuation behavior and grid-alignment checks were informed
+by [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context);
+this project uses sampler-space overlap pinning rather than that project's
+runtime conditioning-layout patches.

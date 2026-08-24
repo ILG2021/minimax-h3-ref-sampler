@@ -18,6 +18,20 @@ H3_VIDEO_FPS = 24
 H3_AUDIO_LATENT_FPS = 40
 
 
+def _audio_step_at_frame(frame_index: int) -> int:
+    """Map an absolute 24-fps frame boundary onto H3's 40-Hz audio grid."""
+    return round(int(frame_index) / H3_VIDEO_FPS * H3_AUDIO_LATENT_FPS)
+
+
+def _audio_overlap_range(start_frame: int, context_frames: int) -> tuple[int, int]:
+    """Return the absolute audio-step interval covered by a video overlap."""
+    start = _audio_step_at_frame(start_frame)
+    end = _audio_step_at_frame(int(start_frame) + int(context_frames))
+    if end <= start:
+        raise ValueError("motion context must cover at least one audio step")
+    return start, end
+
+
 def _video_latent_steps(frame_count: int) -> int:
     """Native H3 temporal VAE size for a supported 5 + 17*n frame run."""
     if frame_count < 5 or frame_count % 17 != 5:
@@ -155,6 +169,26 @@ def _make_model_sampling(model, video_shift: float):
     return sampling
 
 
+def _make_native_av_sampling(model, video_shift: float, audio_shift: float):
+    """Build ComfyUI's native coupled H3 video/audio sampling schedule."""
+    sampling_cls = getattr(comfy.model_sampling, "ModelSamplingAV", None)
+    if sampling_cls is None:
+        raise RuntimeError(
+            "MiniMax H3 sliding windows require a current ComfyUI build "
+            "with native ModelSamplingAV support"
+        )
+
+    class H3NativeAVSampling(sampling_cls, comfy.model_sampling.CONST):
+        pass
+
+    sampling = H3NativeAVSampling(model.model.model_config)
+    sampling.set_parameters(shift=video_shift, audio_shift=audio_shift)
+    original = model.get_model_object("model_sampling")
+    if hasattr(original, "noise_scale"):
+        sampling.set_noise_scale(original.noise_scale)
+    return sampling
+
+
 def _patch_h3_model(model, sampling, video_shift: float, audio_shift: float):
     patched = model.clone()
     patched.add_object_patch("model_sampling", sampling)
@@ -276,48 +310,6 @@ def _make_fixed_audio_sampler(
     return comfy.samplers.KSAMPLER(sample_fixed_audio)
 
 
-def _make_video_context_sampler(video_values, context_mask_p,
-                                context_latent_p, video_noise_p):
-    """Build Euler sampling that pins only the overlapping video prefix."""
-    mask_cpu = context_mask_p.detach().to(device="cpu", dtype=torch.float32)
-    target_cpu = context_latent_p.detach().to(device="cpu", dtype=torch.float32)
-    noise_cpu = video_noise_p.detach().to(device="cpu", dtype=torch.float32)
-
-    def sample_context(model_wrap, x, sigmas, extra_args=None, callback=None,
-                       disable=None):
-        args = {} if extra_args is None else extra_args
-        mask = mask_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
-        target = target_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
-        noise = noise_cpu.to(x.device, x.dtype).reshape(x.shape[0], 1, -1)
-        if not (mask.shape[-1] == target.shape[-1] == noise.shape[-1]
-                == video_values):
-            raise ValueError("motion-context tensors do not match packed video size")
-        sigma_batch = x.new_ones([x.shape[0]])
-        target_noisy = (1.0 - sigmas[0]) * target + sigmas[0] * noise
-        x = torch.cat((
-            x[..., :video_values] * mask + target_noisy * (1.0 - mask),
-            x[..., video_values:],
-        ), dim=-1)
-        for step in comfy.utils.model_trange(len(sigmas) - 1, disable=disable):
-            sigma = sigmas[step]
-            sigma_next = sigmas[step + 1]
-            denoised = model_wrap(x, sigma * sigma_batch, **args)
-            x = x + to_d(x, sigma, denoised) * (sigma_next - sigma)
-            target_noisy = (1.0 - sigma_next) * target + sigma_next * noise
-            video = (
-                x[..., :video_values] * mask
-                + target_noisy * (1.0 - mask)
-            )
-            x = torch.cat((video, x[..., video_values:]), dim=-1)
-            if callback is not None:
-                callback({"x": x, "i": step, "sigma": sigma,
-                          "sigma_hat": sigma, "denoised": denoised})
-        return x
-
-    sample_context.__name__ = "sample_minimax_h3_video_context_euler"
-    return comfy.samplers.KSAMPLER(sample_context)
-
-
 class _BasicPositiveGuider(comfy.samplers.CFGGuider):
     """Same one-condition setup used by ComfyUI's Basic Guider node."""
 
@@ -330,7 +322,8 @@ class _FixedAudioWindowSampler:
 
     def sample(self, model, positive, latent, clean_audio, seed, steps,
                scheduler, shift_video, shift_audio,
-               audio_noise=None, context_video_latent=None, context_frames=0):
+               audio_noise=None, context_video_latent=None, context_frames=0,
+               context_audio_latent=None):
         video, audio_template = _av_parts(latent)
         if video.shape[0] != 1:
             raise ValueError("MiniMax H3 Ref Sampler supports batch size 1")
@@ -363,6 +356,24 @@ class _FixedAudioWindowSampler:
             context_mask = torch.ones_like(video)
             context_mask[:, :, :context_t] = 0.0
 
+        if context_audio_latent is not None:
+            if fixed_audio:
+                raise ValueError("audio context is unnecessary with fixed target audio")
+            if context_video_latent is None:
+                raise ValueError("audio continuation context requires video context")
+            if (not isinstance(context_audio_latent, torch.Tensor)
+                    or context_audio_latent.ndim != 4):
+                raise ValueError("audio continuation context must be [B,32,2,T]")
+            expected_prefix = tuple(audio_template.shape[:3])
+            if tuple(context_audio_latent.shape[:3]) != expected_prefix:
+                raise ValueError(
+                    "audio continuation context layout mismatch: "
+                    f"expected prefix {expected_prefix}, got "
+                    f"{tuple(context_audio_latent.shape[:3])}"
+                )
+            if context_audio_latent.shape[-1] >= audio_template.shape[-1]:
+                raise ValueError("audio continuation context must be shorter than the window")
+
         # Do not pass an inherited inpaint mask into model_wrap. Its generic
         # video-clock blending could overwrite sigma-consistent target audio.
         prepared = dict(latent)
@@ -394,6 +405,7 @@ class _FixedAudioWindowSampler:
             latent_samples, int(seed), prepared.get("batch_index")
         )
         video_noise = None
+        generated_audio_noise = None
         if context_mask is not None:
             if not getattr(noise, "is_nested", False):
                 raise ValueError("expected nested H3 noise for motion context")
@@ -401,6 +413,9 @@ class _FixedAudioWindowSampler:
             if len(noise_parts) != 2:
                 raise ValueError("expected video/audio H3 noise components")
             video_noise = noise_parts[0] * float(
+                getattr(sampling, "noise_scale", 1.0)
+            )
+            generated_audio_noise = noise_parts[1] * float(
                 getattr(sampling, "noise_scale", 1.0)
             )
         if fixed_audio:
@@ -415,7 +430,8 @@ class _FixedAudioWindowSampler:
         elif context_mask is not None:
             sampler = _make_video_context_sampler(
                 math.prod(video.shape[1:]), context_mask, context_latent,
-                video_noise,
+                video_noise, audio_template, context_audio_latent,
+                generated_audio_noise,
             )
         else:
             sampler = comfy.samplers.sampler_object("euler")
