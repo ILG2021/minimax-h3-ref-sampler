@@ -39,7 +39,9 @@ refine pass, segment cache, or segment-export functionality.
 
 When connected, the complete target waveform is resampled only for one Audio-VAE encode. Its
 clean latent and one seed-derived global noise timeline are then sliced by
-absolute 40Hz position for each window. At every sampling step:
+absolute 40Hz position for each window. Each slice is end-aligned to the
+window's absolute output boundary so independent grid rounding cannot shift a
+join by one audio step. At every sampling step:
 
 ```text
 sigma_audio = map_sigma(sigma_video, shift_video, shift_audio)
@@ -65,10 +67,11 @@ The default `window_frames=362` is about 15 seconds at 24 fps. The default
 39, and 56 frames. A shortened final window is generated when possible instead
 of sampling another full 362 frames and discarding most of it.
 
-Both overlap streams are sliced using absolute boundaries: video on H3's
-`5 + 17*n` temporal grid and audio by mapping each 24-fps boundary onto the
-40 Hz latent grid. Mapping the start and end independently avoids accumulated
-rounding drift (a 22-frame overlap alternates between 36 and 37 audio steps).
+Video overlap follows H3's `5 + 17*n` temporal grid. Audio is end-aligned at
+each join: the exact local prefix that will be discarded is copied from the
+previous window's tail. This matters because H3 rounds every window onto its
+40 Hz audio grid independently; deriving the overlap only from frame duration
+can otherwise introduce a duplicated or missing audio step.
 
 Reference images remain static. Reference videos, reference audios, and
 video-associated reference audios are treated as full-timeline media and are
@@ -116,7 +119,8 @@ Minimax H3 Ref Sampler
 
 Requirements:
 
-- a current ComfyUI build with official MiniMax H3 nodes;
+- a current ComfyUI build with official MiniMax H3 nodes, `ModelSamplingAV`,
+  and native H3 audio/video denoise-mask support;
 - MiniMax H3 Ref2VA model, Video VAE, Audio VAE, and MiniMax CLIP;
 - the ComfyUI environment's `torch` and `torchaudio`;
 - batch size 1.

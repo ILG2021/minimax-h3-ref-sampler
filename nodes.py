@@ -1,8 +1,6 @@
 """ComfyUI node orchestration for long H3 reference video with fixed audio."""
 from __future__ import annotations
 
-import math
-
 import torch
 import torchaudio
 
@@ -10,11 +8,8 @@ import comfy.nested_tensor
 import comfy.samplers
 
 from .fixed_audio import (
-    H3_AUDIO_LATENT_FPS,
-    H3_VIDEO_FPS,
     _FixedAudioWindowSampler,
     _align_frame_count,
-    _audio_overlap_range,
     _audio_step_at_frame,
     _av_parts,
     _context_latent_steps,
@@ -131,7 +126,6 @@ class MinimaxH3RefSampler:
         output_template = None
         previous_tail = None
         previous_window_audio = None
-        previous_audio_start_t = None
         context_t = _context_latent_steps(context_frames)
 
         for index, (start_frame, sample_frames) in enumerate(windows):
@@ -160,13 +154,24 @@ class MinimaxH3RefSampler:
                 output_template = dict(latent)
             _, audio_template = _av_parts(latent)
             window_audio_t = int(audio_template.shape[-1])
-            audio_start_t = _audio_step_at_frame(start_frame)
+            wanted_audio_end_t = _audio_step_at_frame(
+                start_frame + sample_frames
+            )
+            audio_window_start_t = wanted_audio_end_t - window_audio_t
+            if audio_window_start_t < 0:
+                raise RuntimeError("H3 audio window starts before the timeline")
+            append_audio_t = wanted_audio_end_t - stitched_audio_t
+            if not 0 < append_audio_t <= window_audio_t:
+                raise ValueError(
+                    "audio window cannot cover its absolute timeline range: "
+                    f"need={append_audio_t}, available={window_audio_t}"
+                )
             if full_clean_audio is not None and global_audio_noise is None:
                 # One absolute noise timeline keeps overlapping target-audio
                 # positions identical across independently seeded video windows.
                 noise_t = max(
-                    audio_start_t + window_audio_t,
-                    round(total_frames / H3_VIDEO_FPS * H3_AUDIO_LATENT_FPS) + 4,
+                    wanted_audio_end_t,
+                    _audio_step_at_frame(total_frames) + 4,
                 )
                 generator = torch.Generator(device="cpu").manual_seed(int(seed))
                 global_audio_noise = torch.randn(
@@ -179,30 +184,28 @@ class MinimaxH3RefSampler:
             context_audio = None
             if full_clean_audio is not None:
                 audio_noise = global_audio_noise[
-                    ..., audio_start_t:audio_start_t + window_audio_t
+                    ..., audio_window_start_t:wanted_audio_end_t
                 ]
                 if audio_noise.shape[-1] != window_audio_t:
                     raise RuntimeError("global fixed-audio noise timeline is too short")
                 clean_audio = full_clean_audio[
-                    ..., audio_start_t:audio_start_t + window_audio_t
+                    ..., audio_window_start_t:wanted_audio_end_t
                 ]
             elif previous_window_audio is not None:
-                overlap_start_t, overlap_end_t = _audio_overlap_range(
-                    start_frame, context_frames
-                )
-                relative_start = overlap_start_t - previous_audio_start_t
-                relative_end = overlap_end_t - previous_audio_start_t
-                if (relative_start < 0
-                        or relative_end > previous_window_audio.shape[-1]):
+                # End-align audio just like the reference implementation. H3
+                # rounds each window's 40-Hz grid independently, so the exact
+                # audio overlap is the local prefix discarded at this join,
+                # not always round(context_frames * 40 / 24).
+                overlap_audio_t = window_audio_t - append_audio_t
+                if not 0 < overlap_audio_t < previous_window_audio.shape[-1]:
                     raise RuntimeError(
-                        "previous audio window cannot cover the continuation "
-                        f"range [{overlap_start_t}, {overlap_end_t})"
+                        "invalid generated-audio overlap: "
+                        f"overlap={overlap_audio_t}, previous="
+                        f"{previous_window_audio.shape[-1]}"
                     )
                 context_audio = previous_window_audio[
-                    ..., relative_start:relative_end
+                    ..., -overlap_audio_t:
                 ].detach().clone()
-                if context_audio.shape[-1] != overlap_end_t - overlap_start_t:
-                    raise RuntimeError("audio continuation slice has the wrong length")
             sampled = sampler.sample(
                 model, positive, latent, clean_audio,
                 (int(seed) + index) & 0xFFFFFFFFFFFFFFFF,
@@ -213,44 +216,41 @@ class MinimaxH3RefSampler:
                 context_audio_latent=context_audio,
             )
             window_video, window_audio = _av_parts(sampled)
-            wanted_audio_end_t = _audio_step_at_frame(
-                start_frame + sample_frames
-            )
-            append_audio_t = wanted_audio_end_t - stitched_audio_t
-            if not 0 < append_audio_t <= window_audio.shape[-1]:
-                raise ValueError(
-                    "fixed-audio window cannot cover its absolute timeline range: "
-                    f"need={append_audio_t}, available={window_audio.shape[-1]}"
-                )
+            if window_audio.shape[-1] != window_audio_t:
+                raise RuntimeError("sampler changed the H3 audio window length")
             if index == 0:
                 video_parts.append(window_video)
             else:
                 video_parts.append(window_video[:, :, context_t:])
             audio_parts.append(window_audio[..., -append_audio_t:])
             stitched_audio_t = wanted_audio_end_t
-            previous_tail = window_video[:, :, -context_t:].detach().clone()
-            previous_window_audio = window_audio.detach().clone()
-            previous_audio_start_t = audio_start_t
+            if index + 1 < len(windows):
+                previous_tail = window_video[
+                    :, :, -context_t:
+                ].detach().clone()
+                if full_clean_audio is None:
+                    previous_window_audio = window_audio.detach().clone()
 
-        out_video = torch.cat(video_parts, dim=2)
-        if total_frames <= window_frames:
-            wanted_video_t = _video_latent_steps(total_frames)
-        else:
-            wanted_video_t = _video_latent_steps(window_frames) + math.ceil(
-                (total_frames - window_frames) / 17
-            ) * 5
-        total_audio_t = max(1, _audio_step_at_frame(total_frames))
-        out_audio = torch.cat(audio_parts, dim=-1)[..., :total_audio_t]
-        if out_video.shape[2] < wanted_video_t:
-            raise RuntimeError("stitched video latent is shorter than the target timeline")
-        if out_audio.shape[-1] < total_audio_t:
-            raise RuntimeError("stitched audio latent is shorter than the output timeline")
         if output_template is None:
             raise RuntimeError("long-video planner produced no windows")
+        out_video = torch.cat(video_parts, dim=2)
+        wanted_video_t = _video_latent_steps(total_frames)
+        total_audio_t = max(1, _audio_step_at_frame(total_frames))
+        out_audio = torch.cat(audio_parts, dim=-1)
+        if out_video.shape[2] != wanted_video_t:
+            raise RuntimeError(
+                "stitched video latent length mismatch: "
+                f"expected={wanted_video_t}, actual={out_video.shape[2]}"
+            )
+        if out_audio.shape[-1] != total_audio_t:
+            raise RuntimeError(
+                "stitched audio latent length mismatch: "
+                f"expected={total_audio_t}, actual={out_audio.shape[-1]}"
+            )
         output = output_template
         output.pop("noise_mask", None)
         output["samples"] = comfy.nested_tensor.NestedTensor((
-            out_video[:, :, :wanted_video_t], out_audio,
+            out_video, out_audio,
         ))
         return (output,)
 

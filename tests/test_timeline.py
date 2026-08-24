@@ -9,7 +9,6 @@ NAMES = {
     "H3_VIDEO_FPS",
     "H3_AUDIO_LATENT_FPS",
     "_audio_step_at_frame",
-    "_audio_overlap_range",
     "_video_latent_steps",
     "_align_frame_count",
     "_plan_windows",
@@ -47,27 +46,21 @@ class SlidingTimelineTests(unittest.TestCase):
             [(0, 362), (340, 39)],
         )
 
-    def test_audio_overlap_uses_absolute_boundaries(self):
-        first = H["_audio_overlap_range"](340, 22)
-        second = H["_audio_overlap_range"](680, 22)
-        self.assertEqual(first, (567, 603))
-        self.assertEqual(second, (1133, 1170))
-        self.assertEqual(first[1] - first[0], 36)
-        self.assertEqual(second[1] - second[0], 37)
-
-    def test_every_continuation_is_covered_by_previous_window(self):
+    def test_audio_overlap_matches_discarded_local_prefix(self):
         for context in (5, 22, 39, 56):
             plan = H["_plan_windows"](2079, 362, context)
-            for (previous_start, previous_length), (start, _) in zip(plan, plan[1:]):
-                overlap_start, overlap_end = H["_audio_overlap_range"](
-                    start, context
-                )
-                previous_audio_start = H["_audio_step_at_frame"](previous_start)
-                previous_audio_end = H["_audio_step_at_frame"](
-                    previous_start + previous_length
-                )
-                self.assertGreaterEqual(overlap_start, previous_audio_start)
-                self.assertLessEqual(overlap_end, previous_audio_end)
+            stitched_end = H["_audio_step_at_frame"](plan[0][1])
+            for start, length in plan[1:]:
+                local_window = H["_audio_step_at_frame"](length)
+                absolute_end = H["_audio_step_at_frame"](start + length)
+                append = absolute_end - stitched_end
+                overlap = local_window - append
+                self.assertGreater(overlap, 0)
+                self.assertLess(overlap, local_window)
+                self.assertEqual(overlap + append, local_window)
+                local_start = absolute_end - local_window
+                self.assertEqual(local_start + overlap, stitched_end)
+                stitched_end = absolute_end
 
     def test_stitched_video_steps_match_aligned_timeline(self):
         for total in (362, 379, 702, 1042, 2079):
@@ -81,6 +74,25 @@ class SlidingTimelineTests(unittest.TestCase):
             self.assertEqual(stitched, H["_video_latent_steps"](
                 H["_align_frame_count"](total)
             ))
+
+    def test_window_properties_across_supported_grid(self):
+        for window in range(22, 363, 17):
+            for context in (5, 22, 39, 56):
+                if context >= window:
+                    continue
+                for requested in range(5, 2048, 17):
+                    total = H["_align_frame_count"](requested)
+                    plan = H["_plan_windows"](total, window, context)
+                    self.assertEqual(plan[0][0], 0)
+                    self.assertEqual(plan[-1][0] + plan[-1][1], total)
+                    for index, (start, length) in enumerate(plan):
+                        self.assertLessEqual(length, window)
+                        self.assertEqual(length % 17, 5)
+                        if index:
+                            self.assertEqual(
+                                start - plan[index - 1][0], window - context
+                            )
+                            self.assertGreater(length, context)
 
 
 if __name__ == "__main__":
