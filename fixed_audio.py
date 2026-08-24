@@ -29,11 +29,6 @@ def _video_latent_steps(frame_count: int) -> int:
     return 2 if frame_count <= 5 else ((frame_count - 5) // 17) * 5 + 2
 
 
-def _context_latent_steps(frame_count: int) -> int:
-    """Latent steps occupied by one exact H3 continuation span."""
-    return _video_latent_steps(frame_count)
-
-
 def _align_frame_count(frame_count: int) -> int:
     frame_count = max(5, int(frame_count))
     return frame_count + ((5 - frame_count) % 17)
@@ -192,22 +187,14 @@ def _patch_h3_model(model, sampling, video_shift: float, audio_shift: float):
 def _make_fixed_audio_sampler(
     clean_audio: torch.Tensor,
     audio_noise: torch.Tensor,
-    video_noise: torch.Tensor | None,
     video_values: int,
     video_shift: float,
     audio_shift: float,
-    context_mask_p: torch.Tensor | None,
-    context_latent_p: torch.Tensor | None,
 ):
     """Build Euler sampler that integrates video only and reconstructs audio."""
     packed_values = video_values + math.prod(clean_audio.shape[1:])
     clean_cpu = clean_audio.detach().to(device="cpu", dtype=torch.float32)
     noise_cpu = audio_noise.detach().to(device="cpu", dtype=torch.float32)
-    video_noise_cpu = None
-    if video_noise is not None:
-        video_noise_cpu = video_noise.detach().to(
-            device="cpu", dtype=torch.float32
-        )
 
     def sample_fixed_audio(model_wrap, x, sigmas, extra_args=None, callback=None,
                            disable=None):
@@ -225,32 +212,6 @@ def _make_fixed_audio_sampler(
         sigma_batch = x.new_ones([x.shape[0]])
         video = x[..., :video_values]  # pure noise video
 
-        context_mask = None
-        context_latent = None
-        target_noise = None
-        if context_mask_p is not None and context_latent_p is not None:
-            context_mask = context_mask_p.to(
-                device=x.device, dtype=x.dtype
-            ).reshape(x.shape[0], 1, -1)
-            context_latent = context_latent_p.to(
-                device=x.device, dtype=x.dtype
-            ).reshape(x.shape[0], 1, -1)
-            if video_noise_cpu is None:
-                raise ValueError("video noise is required for motion context")
-            target_noise = video_noise_cpu.to(
-                device=x.device, dtype=x.dtype
-            ).reshape(x.shape[0], 1, -1)
-            if context_mask.shape[-1] != video_values:
-                raise ValueError(
-                    "context mask packed size mismatch: "
-                    f"expected {video_values}, got {context_mask.shape[-1]}"
-                )
-            target_noisy = (
-                (1.0 - sigmas[0]) * context_latent
-                + sigmas[0] * target_noise
-            )
-            video = video * context_mask + target_noisy * (1.0 - context_mask)
-
         for step in comfy.utils.model_trange(len(sigmas) - 1, disable=disable):
             sigma_v = sigmas[step]
             sigma_v_next = sigmas[step + 1]
@@ -267,15 +228,6 @@ def _make_fixed_audio_sampler(
 
             # Integrate only target video on the outer video clock.
             video = video + derivative[..., :video_values] * (sigma_v_next - sigma_v)
-            if context_mask is not None and context_latent is not None:
-                target_noisy = (
-                    (1.0 - sigma_v_next) * context_latent
-                    + sigma_v_next * target_noise
-                )
-                video = (
-                    video * context_mask
-                    + (1.0 - context_mask) * target_noisy
-                )
             # The model's audio prediction is deliberately ignored. Build the
             # exact next audio state from a0, epsilon_a and sigma_audio(next).
             audio_next = (1.0 - sigma_a_next) * clean + sigma_a_next * noise
@@ -308,83 +260,22 @@ class _BasicPositiveGuider(comfy.samplers.CFGGuider):
 
 
 class _FixedAudioWindowSampler:
-    """Sample one H3 AV window with optional overlap or fixed target audio."""
+    """Sample one H3 AV window with optional fixed target audio."""
 
     def sample(self, model, positive, latent, clean_audio, seed, steps,
                scheduler, shift_video, shift_audio,
-               audio_noise=None, context_video_latent=None, context_frames=0,
-               context_audio_latent=None):
+               audio_noise=None):
         video, audio_template = _av_parts(latent)
         if video.shape[0] != 1:
             raise ValueError("MiniMax H3 Ref Sampler supports batch size 1")
         fixed_audio = clean_audio is not None
         if fixed_audio:
             clean_audio = _fit_audio_latent(clean_audio, audio_template)
-        context_latent = None
-        context_mask = None
-
-        if context_video_latent is not None:
-            context = context_video_latent
-            if not isinstance(context, torch.Tensor) or context.ndim != 5:
-                raise ValueError("continuation context must be [B,24,T,H,W]")
-            context_t = _context_latent_steps(int(context_frames))
-            if context_t >= video.shape[2]:
-                raise ValueError("continuation context must be shorter than the window")
-            expected = (
-                video.shape[0], video.shape[1], context_t,
-                video.shape[3], video.shape[4],
-            )
-            if tuple(context.shape) != tuple(expected):
-                raise ValueError(
-                    "continuation context layout mismatch: "
-                    f"expected {expected}, got {tuple(context.shape)}"
-                )
-            context_latent = torch.zeros_like(video)
-            context_latent[:, :, :context_t] = context.to(
-                device=video.device, dtype=video.dtype
-            )
-            context_mask = torch.ones_like(video)
-            context_mask[:, :, :context_t] = 0.0
-
-        if context_audio_latent is not None:
-            if fixed_audio:
-                raise ValueError("audio context is unnecessary with fixed target audio")
-            if context_video_latent is None:
-                raise ValueError("audio continuation context requires video context")
-            if (not isinstance(context_audio_latent, torch.Tensor)
-                    or context_audio_latent.ndim != 4):
-                raise ValueError("audio continuation context must be [B,32,2,T]")
-            expected_prefix = tuple(audio_template.shape[:3])
-            if tuple(context_audio_latent.shape[:3]) != expected_prefix:
-                raise ValueError(
-                    "audio continuation context layout mismatch: "
-                    f"expected prefix {expected_prefix}, got "
-                    f"{tuple(context_audio_latent.shape[:3])}"
-                )
-            if context_audio_latent.shape[-1] >= audio_template.shape[-1]:
-                raise ValueError("audio continuation context must be shorter than the window")
-
         prepared = dict(latent)
         prepared.pop("noise_mask", None)
-        denoise_mask = None
-        prepared_video = video
         prepared_audio = clean_audio if fixed_audio else audio_template
-        if context_mask is not None and not fixed_audio:
-            if context_audio_latent is None:
-                raise ValueError("generated AV continuation requires audio context")
-            audio_context_t = int(context_audio_latent.shape[-1])
-            prepared_video = context_latent
-            prepared_audio = torch.zeros_like(audio_template)
-            prepared_audio[..., :audio_context_t] = context_audio_latent.to(
-                device=audio_template.device, dtype=audio_template.dtype
-            )
-            audio_mask = torch.ones_like(audio_template)
-            audio_mask[..., :audio_context_t] = 0.0
-            denoise_mask = comfy.nested_tensor.NestedTensor((
-                context_mask, audio_mask,
-            ))
         prepared["samples"] = comfy.nested_tensor.NestedTensor(
-            (prepared_video, prepared_audio)
+            (video, prepared_audio)
         )
 
         if fixed_audio:
@@ -396,17 +287,6 @@ class _FixedAudioWindowSampler:
         sampling_model = _patch_h3_model(
             model, sampling, shift_video, shift_audio
         )
-        if not fixed_audio:
-            if denoise_mask is not None:
-                base_model = getattr(sampling_model, "model", None)
-                if (not callable(getattr(base_model, "scale_latent_inpaint", None))
-                        or not callable(getattr(base_model,
-                                                "_denoise_mask_values", None))):
-                    raise RuntimeError(
-                        "MiniMax H3 AV sliding-window continuation requires "
-                        "a current ComfyUI build with native H3 audio/video "
-                        "denoise-mask support"
-                    )
         sigmas = comfy.samplers.calculate_sigmas(
             sampling, scheduler, int(steps)
         ).cpu()
@@ -421,24 +301,13 @@ class _FixedAudioWindowSampler:
         noise = comfy.sample.prepare_noise(
             latent_samples, int(seed), prepared.get("batch_index")
         )
-        video_noise = None
-        if context_mask is not None and fixed_audio:
-            if not getattr(noise, "is_nested", False):
-                raise ValueError("expected nested H3 noise for motion context")
-            noise_parts = tuple(noise.unbind())
-            if len(noise_parts) != 2:
-                raise ValueError("expected video/audio H3 noise components")
-            video_noise = noise_parts[0] * float(
-                getattr(sampling, "noise_scale", 1.0)
-            )
         if fixed_audio:
             if audio_noise is None or tuple(audio_noise.shape) != tuple(clean_audio.shape):
                 raise ValueError("fixed audio noise does not match the encoded window")
             audio_noise = audio_noise * float(getattr(sampling, "noise_scale", 1.0))
             sampler = _make_fixed_audio_sampler(
-                clean_audio, audio_noise, video_noise,
-                math.prod(video.shape[1:]), shift_video, shift_audio,
-                context_mask, context_latent,
+                clean_audio, audio_noise, math.prod(video.shape[1:]),
+                shift_video, shift_audio,
             )
         else:
             sampler = comfy.samplers.sampler_object("euler")
@@ -450,7 +319,7 @@ class _FixedAudioWindowSampler:
             latent_samples,
             sampler,
             sigmas,
-            denoise_mask=denoise_mask,
+            denoise_mask=None,
             callback=None,
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
             seed=int(seed),

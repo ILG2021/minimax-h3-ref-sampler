@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).parents[1] / "fixed_audio.py"
+NODES_SOURCE = Path(__file__).parents[1] / "nodes.py"
+MOTION_SOURCE = Path(__file__).parents[1] / "h3_motion_context.py"
 NAMES = {
     "H3_VIDEO_FPS",
     "H3_AUDIO_LATENT_FPS",
@@ -35,7 +37,51 @@ def _load_helpers():
 H = _load_helpers()
 
 
+def _load_motion_grid_helpers():
+    names = {
+        "FRAME_PER_TOKEN",
+        "pixel_frames_for_latent_t",
+        "steps_for_frames",
+        "step_offsets",
+    }
+    tree = ast.parse(
+        MOTION_SOURCE.read_text(encoding="utf-8"), filename=str(MOTION_SOURCE)
+    )
+    selected = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id in names
+                   for target in targets):
+                selected.append(node)
+        elif isinstance(node, ast.FunctionDef) and node.name in names:
+            selected.append(node)
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]),
+                 str(MOTION_SOURCE), "exec"), namespace)
+    return namespace
+
+
+M = _load_motion_grid_helpers()
+
+
 class SlidingTimelineTests(unittest.TestCase):
+    def test_motion_context_grid(self):
+        expected_steps = {5: 2, 22: 7, 39: 12, 56: 17}
+        for frames, steps in expected_steps.items():
+            self.assertEqual(M["steps_for_frames"](frames), steps)
+            self.assertEqual(M["pixel_frames_for_latent_t"](steps), frames)
+        self.assertEqual(M["step_offsets"](7), [0, 1, 5, 9, 13, 17, 18])
+
+    def test_continuity_uses_conditioning_not_target_latent_overwrite(self):
+        fixed_source = SOURCE.read_text(encoding="utf-8")
+        nodes_source = NODES_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("apply_motion_context(", nodes_source)
+        self.assertIn("context_latent=previous_sampled", nodes_source)
+        self.assertNotIn("context_video_latent", fixed_source)
+        self.assertNotIn("context_audio_latent", fixed_source)
+        self.assertNotIn("context_latent[:, :, :context_t]", fixed_source)
+
     def test_full_and_short_final_windows(self):
         self.assertEqual(
             H["_plan_windows"](702, 362, 22),

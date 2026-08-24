@@ -11,8 +11,10 @@ component.
 
 - `nodes.py`: public ComfyUI node, reference-conditioning loop, absolute
   timeline orchestration, and final AV stitching.
+- `h3_motion_context.py` / `h3_context_patches.py`: Motion Context handoff,
+  H3 position-layout rewriting, and keyframe/reference payload coexistence.
 - `fixed_audio.py`: H3 frame-grid helpers, media-window slicing, sigma mapping,
-  motion-context pinning, and the single-window fixed-audio sampler.
+  and the single-window fixed-audio sampler.
 - `__init__.py`: ComfyUI node exports only.
 
 ## Features
@@ -23,10 +25,11 @@ component.
   and 3 video-associated reference audios.
 - Uses the `frames` input as the output timeline.
 - Generates at most 362 H3-aligned frames per window.
-- Pins the previous window's video and generated-audio latent tails into the
-  next window at the current sigma, then removes the duplicated prefix during
-  concatenation. With `target_audio`, the fixed global audio timeline is used
-  instead of generated-audio continuation.
+- Injects the previous window's AV latent tail into the next window's
+  `positive` conditioning as Motion Context keyframes, then removes the
+  duplicated prefix during concatenation. The next window's target latent is
+  not overwritten. With `target_audio`, the fixed global audio timeline is
+  used instead of generated-audio continuation.
 - Slices reference video/audio inputs and optional target audio on the same absolute
   24-fps timeline for every window.
 - When supplied, forces the target audio latent throughout sampling and ignores
@@ -49,7 +52,7 @@ audio_t = (1 - sigma_audio) * a0 + sigma_audio * epsilon_audio
 ```
 
 In fixed-audio mode the model sees the correctly noised target audio, but only the video prediction
-is integrated. The final AV latent contains the clean target-audio latent. The
+is integrated. The final AV latent contains the clean target-audio latent.
 
 ## Long-video timeline
 
@@ -67,11 +70,14 @@ The default `window_frames=362` is about 15 seconds at 24 fps. The default
 39, and 56 frames. A shortened final window is generated when possible instead
 of sampling another full 362 frames and discarding most of it.
 
-Video overlap follows H3's `5 + 17*n` temporal grid. Audio is end-aligned at
-each join: the exact local prefix that will be discarded is copied from the
-previous window's tail. This matters because H3 rounds every window onto its
-40 Hz audio grid independently; deriving the overlap only from frame duration
-can otherwise introduce a duplicated or missing audio step.
+Video overlap follows H3's `5 + 17*n` temporal grid. At every handoff, the
+previous AV latent tail becomes marked `minimax_keyframes` / `minimax_refs` in
+the next window's conditioning. Runtime patches give those blocks their real
+target-head coordinates and merge them with ordinary Ref2VA references. The
+fresh target latent remains unchanged; after sampling, the conditioned head is
+discarded and only the new tail is appended. Audio stitching uses each
+window's absolute 40-Hz endpoint so independent grid rounding cannot duplicate
+or omit a step.
 
 Reference images remain static. Reference videos, reference audios, and
 video-associated reference audios are treated as full-timeline media and are
@@ -119,8 +125,7 @@ Minimax H3 Ref Sampler
 
 Requirements:
 
-- a current ComfyUI build with official MiniMax H3 nodes, `ModelSamplingAV`,
-  and native H3 audio/video denoise-mask support;
+- a current ComfyUI build with official MiniMax H3 nodes and `ModelSamplingAV`;
 - MiniMax H3 Ref2VA model, Video VAE, Audio VAE, and MiniMax CLIP;
 - the ComfyUI environment's `torch` and `torchaudio`;
 - batch size 1.
@@ -136,14 +141,18 @@ Requirements:
   substantially increase memory use.
 - The node expects the official H3 AV layout: video `[B,24,T,H,W]`, audio
   `[B,32,2,T]`.
+- Do not enable this node's long-video continuity together with Director's
+  continuity or a standalone H3 Motion Context pack in the same ComfyUI
+  process. They patch the same H3 layout/payload entry points; this node detects
+  an existing owner and stops with an explicit error instead of double-wrapping.
 
 ## Attribution
 
-The single-timeline implementation uses the long-video planning ideas and
-official-conditioning integration patterns from
+The Motion Context helpers and H3 runtime patches are adapted from
 [AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director),
-licensed under Apache-2.0. Fixed-target-audio sampling is implemented in this
-project. The AV continuation behavior and grid-alignment checks were informed
-by [NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context);
-this project uses sampler-space overlap pinning rather than that project's
-runtime conditioning-layout patches.
+licensed under Apache-2.0; modified files retain adaptation notices and this
+repository includes the license text. Director's implementation was informed
+by the community
+[NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
+approach. Fixed-target-audio sampling and its absolute audio timeline are
+implemented in this project.

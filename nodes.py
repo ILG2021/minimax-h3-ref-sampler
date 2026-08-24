@@ -12,7 +12,6 @@ from .fixed_audio import (
     _align_frame_count,
     _audio_step_at_frame,
     _av_parts,
-    _context_latent_steps,
     _plan_windows,
     _slice_audio_window,
     _slice_video_window,
@@ -20,6 +19,7 @@ from .fixed_audio import (
     _validate_audio,
     _video_latent_steps,
 )
+from .h3_motion_context import apply_motion_context
 
 
 class MinimaxH3RefSampler:
@@ -124,9 +124,8 @@ class MinimaxH3RefSampler:
         stitched_audio_t = 0
         global_audio_noise = None
         output_template = None
-        previous_tail = None
-        previous_window_audio = None
-        context_t = _context_latent_steps(context_frames)
+        previous_sampled = None
+        context_t = _video_latent_steps(context_frames)
 
         for index, (start_frame, sample_frames) in enumerate(windows):
             ref_videos = {
@@ -150,6 +149,20 @@ class MinimaxH3RefSampler:
                 ref_audios=ref_audios,
             )
             positive, latent = _unpack_official_conditioning(conditioned)
+            if previous_sampled is not None:
+                positive, pinned_frames = apply_motion_context(
+                    positive,
+                    latent,
+                    context_length=context_frames,
+                    context_latent=previous_sampled,
+                    continue_audio=full_clean_audio is None,
+                    audio_context_length=context_frames,
+                )
+                if pinned_frames != context_frames:
+                    raise RuntimeError(
+                        "Motion Context handoff does not match the planned overlap: "
+                        f"pinned={pinned_frames}, expected={context_frames}"
+                    )
             if output_template is None:
                 output_template = dict(latent)
             _, audio_template = _av_parts(latent)
@@ -181,7 +194,6 @@ class MinimaxH3RefSampler:
                 )
             audio_noise = None
             clean_audio = None
-            context_audio = None
             if full_clean_audio is not None:
                 audio_noise = global_audio_noise[
                     ..., audio_window_start_t:wanted_audio_end_t
@@ -191,29 +203,11 @@ class MinimaxH3RefSampler:
                 clean_audio = full_clean_audio[
                     ..., audio_window_start_t:wanted_audio_end_t
                 ]
-            elif previous_window_audio is not None:
-                # End-align audio just like the reference implementation. H3
-                # rounds each window's 40-Hz grid independently, so the exact
-                # audio overlap is the local prefix discarded at this join,
-                # not always round(context_frames * 40 / 24).
-                overlap_audio_t = window_audio_t - append_audio_t
-                if not 0 < overlap_audio_t < previous_window_audio.shape[-1]:
-                    raise RuntimeError(
-                        "invalid generated-audio overlap: "
-                        f"overlap={overlap_audio_t}, previous="
-                        f"{previous_window_audio.shape[-1]}"
-                    )
-                context_audio = previous_window_audio[
-                    ..., -overlap_audio_t:
-                ].detach().clone()
             sampled = sampler.sample(
                 model, positive, latent, clean_audio,
                 (int(seed) + index) & 0xFFFFFFFFFFFFFFFF,
                 steps, scheduler, shift_video, shift_audio,
                 audio_noise,
-                context_video_latent=previous_tail,
-                context_frames=context_frames if previous_tail is not None else 0,
-                context_audio_latent=context_audio,
             )
             window_video, window_audio = _av_parts(sampled)
             if window_audio.shape[-1] != window_audio_t:
@@ -225,11 +219,10 @@ class MinimaxH3RefSampler:
             audio_parts.append(window_audio[..., -append_audio_t:])
             stitched_audio_t = wanted_audio_end_t
             if index + 1 < len(windows):
-                previous_tail = window_video[
-                    :, :, -context_t:
-                ].detach().clone()
-                if full_clean_audio is None:
-                    previous_window_audio = window_audio.detach().clone()
+                # Motion Context extracts the phase-aligned AV tail and injects
+                # it into the next window's conditioning. The next target
+                # latent itself stays untouched.
+                previous_sampled = sampled
 
         if output_template is None:
             raise RuntimeError("long-video planner produced no windows")
