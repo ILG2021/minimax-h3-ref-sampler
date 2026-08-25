@@ -1,17 +1,19 @@
-"""Dependency-free checks for H3 sliding-window timeline arithmetic."""
+"""Dependency-free checks for the masked music-video timeline."""
 import ast
 import unittest
 from pathlib import Path
 
 
-SOURCE = Path(__file__).parents[1] / "fixed_audio.py"
-NODES_SOURCE = Path(__file__).parents[1] / "nodes.py"
-MOTION_SOURCE = Path(__file__).parents[1] / "h3_motion_context.py"
+ROOT = Path(__file__).parents[1]
+SOURCE = ROOT / "music_video.py"
+NODES_SOURCE = ROOT / "nodes.py"
 NAMES = {
     "H3_VIDEO_FPS",
     "H3_AUDIO_LATENT_FPS",
+    "FRAME_PER_TOKEN",
     "_audio_step_at_frame",
     "_video_latent_steps",
+    "_pixel_frames",
     "_align_frame_count",
     "_plan_windows",
 }
@@ -29,116 +31,84 @@ def _load_helpers():
         elif isinstance(node, ast.FunctionDef) and node.name in NAMES:
             selected.append(node)
     namespace = {}
-    exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"),
-         namespace)
+    exec(compile(ast.Module(body=selected, type_ignores=[]),
+                 str(SOURCE), "exec"), namespace)
     return namespace
 
 
 H = _load_helpers()
 
 
-def _load_motion_grid_helpers():
-    names = {
-        "FRAME_PER_TOKEN",
-        "pixel_frames_for_latent_t",
-        "steps_for_frames",
-        "step_offsets",
-    }
-    tree = ast.parse(
-        MOTION_SOURCE.read_text(encoding="utf-8"), filename=str(MOTION_SOURCE)
-    )
-    selected = []
-    for node in tree.body:
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(target, ast.Name) and target.id in names
-                   for target in targets):
-                selected.append(node)
-        elif isinstance(node, ast.FunctionDef) and node.name in names:
-            selected.append(node)
-    namespace = {}
-    exec(compile(ast.Module(body=selected, type_ignores=[]),
-                 str(MOTION_SOURCE), "exec"), namespace)
-    return namespace
-
-
-M = _load_motion_grid_helpers()
-
-
-class SlidingTimelineTests(unittest.TestCase):
-    def test_motion_context_grid(self):
-        expected_steps = {5: 2, 22: 7, 39: 12, 56: 17}
+class MusicVideoTimelineTests(unittest.TestCase):
+    def test_h3_video_grid(self):
+        expected_steps = {5: 2, 22: 7, 39: 12, 56: 17, 90: 27}
         for frames, steps in expected_steps.items():
-            self.assertEqual(M["steps_for_frames"](frames), steps)
-            self.assertEqual(M["pixel_frames_for_latent_t"](steps), frames)
-        self.assertEqual(M["step_offsets"](7), [0, 1, 5, 9, 13, 17, 18])
+            self.assertEqual(H["_video_latent_steps"](frames), steps)
+            self.assertEqual(H["_pixel_frames"](steps), frames)
 
-    def test_continuity_uses_conditioning_not_target_latent_overwrite(self):
-        fixed_source = SOURCE.read_text(encoding="utf-8")
-        nodes_source = NODES_SOURCE.read_text(encoding="utf-8")
-        self.assertIn("apply_motion_context(", nodes_source)
-        self.assertIn("context_latent=previous_sampled", nodes_source)
-        self.assertNotIn("context_video_latent", fixed_source)
-        self.assertNotIn("context_audio_latent", fixed_source)
-        self.assertNotIn("context_latent[:, :, :context_t]", fixed_source)
-
-    def test_full_and_short_final_windows(self):
+    def test_default_39_frame_train(self):
         self.assertEqual(
-            H["_plan_windows"](702, 362, 22),
-            [(0, 362), (340, 362)],
+            H["_plan_windows"](685, 362, 39),
+            [(0, 362), (323, 362)],
         )
         self.assertEqual(
-            H["_plan_windows"](379, 362, 22),
-            [(0, 362), (340, 39)],
+            H["_plan_windows"](379, 362, 39),
+            [(0, 362), (323, 56)],
         )
 
-    def test_audio_overlap_matches_discarded_local_prefix(self):
-        for context in (5, 22, 39, 56):
-            plan = H["_plan_windows"](2079, 362, context)
-            stitched_end = H["_audio_step_at_frame"](plan[0][1])
-            for start, length in plan[1:]:
-                local_window = H["_audio_step_at_frame"](length)
-                absolute_end = H["_audio_step_at_frame"](start + length)
-                append = absolute_end - stitched_end
-                overlap = local_window - append
-                self.assertGreater(overlap, 0)
-                self.assertLess(overlap, local_window)
-                self.assertEqual(overlap + append, local_window)
-                local_start = absolute_end - local_window
-                self.assertEqual(local_start + overlap, stitched_end)
-                stitched_end = absolute_end
+    def test_all_windows_are_phase_aligned(self):
+        for total in range(5, 2500, 17):
+            plan = H["_plan_windows"](total, 362, 39)
+            for index, (start, length) in enumerate(plan):
+                self.assertEqual(length % 17, 5)
+                self.assertLessEqual(length, 362)
+                if index:
+                    self.assertEqual(start - plan[index - 1][0], 323)
+                    self.assertGreater(length, 39)
+                    source_steps = H["_video_latent_steps"](plan[index - 1][1])
+                    self.assertEqual(
+                        (source_steps - H["_video_latent_steps"](39)) % 5, 0
+                    )
 
-    def test_stitched_video_steps_match_aligned_timeline(self):
-        for total in (362, 379, 702, 1042, 2079):
-            plan = H["_plan_windows"](total, 362, 22)
-            context_steps = H["_video_latent_steps"](22)
-            stitched = H["_video_latent_steps"](plan[0][1])
-            stitched += sum(
-                H["_video_latent_steps"](length) - context_steps
-                for _, length in plan[1:]
+    def test_absolute_audio_stitch_has_no_grid_drift(self):
+        for total in range(5, 2500, 17):
+            plan = H["_plan_windows"](total, 362, 39)
+            stitched = 0
+            for start, length in plan:
+                end = H["_audio_step_at_frame"](start + length)
+                append = end - stitched
+                local = H["_audio_step_at_frame"](length)
+                self.assertGreater(append, 0)
+                self.assertLessEqual(append, local)
+                stitched = end
+            self.assertEqual(
+                stitched,
+                H["_audio_step_at_frame"](H["_align_frame_count"](total)),
             )
-            self.assertEqual(stitched, H["_video_latent_steps"](
-                H["_align_frame_count"](total)
-            ))
 
-    def test_window_properties_across_supported_grid(self):
-        for window in range(22, 363, 17):
-            for context in (5, 22, 39, 56):
-                if context >= window:
-                    continue
-                for requested in range(5, 2048, 17):
-                    total = H["_align_frame_count"](requested)
-                    plan = H["_plan_windows"](total, window, context)
-                    self.assertEqual(plan[0][0], 0)
-                    self.assertEqual(plan[-1][0] + plan[-1][1], total)
-                    for index, (start, length) in enumerate(plan):
-                        self.assertLessEqual(length, window)
-                        self.assertEqual(length % 17, 5)
-                        if index:
-                            self.assertEqual(
-                                start - plan[index - 1][0], window - context
-                            )
-                            self.assertGreater(length, context)
+    def test_masked_music_video_architecture_is_active(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        nodes = NODES_SOURCE.read_text(encoding="utf-8")
+        self.assertIn("out_video[:, :, :context_steps]", source)
+        self.assertIn("video_mask[:, :, :context_steps] = 0.0", source)
+        self.assertIn("audio_mask = torch.zeros(", source)
+        self.assertIn('prepared["noise_mask"]', source)
+        self.assertIn('denoise_mask=latent.get("noise_mask")', source)
+        self.assertIn("PixelCrossfadeAssembler", nodes)
+        self.assertIn("video_vae.decode(window_video)", nodes)
+        self.assertIn("return output, images, master_audio", nodes)
+        self.assertIn("if not self.started:", source)
+        self.assertIn("if self.tail is None or", source)
+        self.assertNotIn("int(seed) + index", nodes)
+        self.assertNotIn("for index,", nodes)
+        self.assertEqual(nodes.count("_validate_audio"), 0)
+        self.assertIn("model, positive, prepared,\n                int(seed),", nodes)
+        self.assertNotIn("apply_motion_context", nodes)
+
+    def test_project_is_gpl(self):
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3", license_text)
 
 
 if __name__ == "__main__":

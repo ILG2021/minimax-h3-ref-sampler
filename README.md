@@ -1,158 +1,151 @@
-# Minimax H3 Ref Sampler
+# Minimax H3 Ref Sampler — Masked Music Video
 
-`Minimax H3 Ref Sampler` is a single-timeline ComfyUI node for MiniMax H3
-Ref2VA. It combines official reference conditioning, overlapping long-video
-generation, and an optional fixed target soundtrack in one node.
+This ComfyUI custom node turns the MultiRef Music Video train into one internal
+loop. It generates long MiniMax H3 Ref2VA videos against one authoritative
+master soundtrack without manually wiring one sampler group per clip.
 
-This is an experimental community node, not an official MiniMax or ComfyUI
+This is an experimental community project, not an official MiniMax or ComfyUI
 component.
 
-## Code structure
+## Recommended workflow
 
-- `nodes.py`: public ComfyUI node, reference-conditioning loop, absolute
-  timeline orchestration, and final AV stitching.
-- `h3_motion_context.py` / `h3_context_patches.py`: Motion Context handoff,
-  H3 position-layout rewriting, and keyframe/reference payload coexistence.
-- `fixed_audio.py`: H3 frame-grid helpers, media-window slicing, sigma mapping,
-  and the single-window fixed-audio sampler.
-- `__init__.py`: ComfyUI node exports only.
-
-## Features
-
-- Builds every window through ComfyUI's official
-  `MiniMaxH3ReferenceToVideo` implementation.
-- Accepts up to 9 reference images, 3 reference videos, 3 reference audios,
-  and 3 video-associated reference audios.
-- Uses the `frames` input as the output timeline.
-- Generates at most 362 H3-aligned frames per window.
-- Injects the previous window's AV latent tail into the next window's
-  `positive` conditioning as Motion Context keyframes, then removes the
-  duplicated prefix during concatenation. The next window's target latent is
-  not overwritten. With `target_audio`, the fixed global audio timeline is
-  used instead of generated-audio continuation.
-- Slices reference video/audio inputs and optional target audio on the same absolute
-  24-fps timeline for every window.
-- When supplied, forces the target audio latent throughout sampling and ignores
-  the model's predicted audio stream. Otherwise, H3 generates the audio.
-
-The node intentionally has no local repaint, mask, multi-stage timeline,
-refine pass, segment cache, or segment-export functionality.
-
-## Fixed-audio sampling
-
-When connected, the complete target waveform is resampled only for one Audio-VAE encode. Its
-clean latent and one seed-derived global noise timeline are then sliced by
-absolute 40Hz position for each window. Each slice is end-aligned to the
-window's absolute output boundary so independent grid rounding cannot shift a
-join by one audio step. At every sampling step:
+Use the node as the complete generator and connect its finished-media outputs:
 
 ```text
-sigma_audio = map_sigma(sigma_video, shift_video, shift_audio)
-audio_t = (1 - sigma_audio) * a0 + sigma_audio * epsilon_audio
+Load H3 model/CLIP/VAEs ─┐
+Load master audio ───────┼─> Minimax H3 Ref Sampler (Masked Music Video)
+references + prompt ─────┘                         │
+                                                   ├─ images ──────┐
+                                                   └─ master_audio ┼─> VHS Video Combine
 ```
 
-In fixed-audio mode the model sees the correctly noised target audio, but only the video prediction
-is integrated. The final AV latent contains the clean target-audio latent.
+Use `images`, not a later decode of `samples`, for the final movie. Only the
+`images` output contains the pixel-domain seam crossfade. The returned
+`master_audio` is the original input object and is not an H3 reconstruction.
 
-## Long-video timeline
+## How it works
 
-H3 video lengths use the `5 + 17*n` frame grid. The node aligns `frames`
-upward to this grid and creates overlapping windows:
+Each H3-aligned window is prepared through ComfyUI's official
+`MiniMaxH3ReferenceToVideo` node. The first window uses a normal video target.
+For every continuation:
+
+1. copy the previous sampled video latent tail into the new target prefix;
+2. set that prefix's video denoise mask to `0`;
+3. leave the future video mask at `1`;
+4. cut the exact absolute master-audio interval for the window;
+5. Audio-VAE encode it into the complete target audio latent;
+6. set the complete audio denoise mask to `0`;
+7. sample with native H3 AV masking;
+8. decode the clip and crossfade the final matching context frames;
+9. discard duplicated latent context and continue the internal loop.
+
+Mask semantics:
 
 ```text
-window 1: [0 ................................ 361]
-window 2:                     [340 .......... 701]
-                                      22-frame context
+VIDEO: [previous tail                         ][new future ...]
+MASK:  [0 0 0 0 0                            ][1 1 1 1 ...]
+
+AUDIO: [exact master-song window                              ]
+MASK:  [0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ...              ]
 ```
 
-The default `window_frames=362` is about 15 seconds at 24 fps. The default
-`context_frames=22` is about 0.92 seconds. Supported context choices are 5, 22,
-39, and 56 frames. A shortened final window is generated when possible instead
-of sampling another full 362 frames and discarding most of it.
+The default context and pixel crossfade are both 39 frames. This follows the
+current MultiRef Music Video workflow instead of the older guide-conditioning
+Motion Context approach.
 
-Video overlap follows H3's `5 + 17*n` temporal grid. At every handoff, the
-previous AV latent tail becomes marked `minimax_keyframes` / `minimax_refs` in
-the next window's conditioning. Runtime patches give those blocks their real
-target-head coordinates and merge them with ordinary Ref2VA references. The
-fresh target latent remains unchanged; after sampling, the conditioned head is
-discarded and only the new tail is appended. Audio stitching uses each
-window's absolute 40-Hz endpoint so independent grid rounding cannot duplicate
-or omit a step.
-
-Reference images remain static. Reference videos, reference audios, and
-video-associated reference audios are treated as full-timeline media and are
-cut at each window's absolute start. Short media is padded: audio with silence,
-video by holding its final frame. Reference audio and `target_audio` are
-downmixed to mono before encoding.
+All internal windows reuse the exact same `seed`. There is no hidden
+`seed + window_index` increment.
 
 ## Inputs
 
-| Input | Type | Description |
-|---|---|---|
-| `model` | `MODEL` | MiniMax H3 Ref2VA model. |
-| `clip` | `CLIP` | MiniMax/Qwen3-VL text and multimodal encoder. |
-| `video_vae` | `VAE` | H3 Video VAE used by official reference preparation. |
-| `audio_vae` | `VAE` | H3 Audio VAE used for references and fixed target audio. |
-| `prompt` | `STRING` | H3 prompt with `<Picture N>`, `<Video N>`, and `<Audio N>` references. |
-| `width`, `height` | `INT` | Output canvas passed to official conditioning. |
-| `frames` | `INT` | Requested output duration in frames; aligned upward to `5 + 17*n`. |
-| `window_frames` | `INT` | Maximum aligned generation window; default/max 362. |
-| `context_frames` | choice | Video continuation overlap: 5, 22, 39, or 56. |
-| `ref_image_size` | choice | Official reference-image sizing mode. |
-| `seed` | `INT` | Base seed; window `N` uses `seed + N`. |
-| `steps`, `scheduler` | sampling | H3 sampling schedule. |
-| `shift_video`, `shift_audio` | `FLOAT` | H3 video/audio flow shifts. |
-| `target_audio` | `AUDIO` | Optional fixed soundtrack, downmixed to mono; it does not determine output duration. |
-| `ref_image_0..8` | `IMAGE` | Static picture references. |
-| `ref_video_0..2` | `IMAGE` | Timeline-aligned reference videos. |
-| `ref_audio_0..2` | `AUDIO` | Timeline-aligned reference audios. |
-| `ref_video_audio_0..2` | `AUDIO` | Audio paired with the corresponding reference video. |
+| Input | Description |
+|---|---|
+| `model`, `clip` | MiniMax H3 Ref2VA model and multimodal text encoder. |
+| `video_vae`, `audio_vae` | H3 video and audio VAEs. |
+| `master_audio` | Required authoritative mono/stereo soundtrack. |
+| `prompt` | One H3 prompt applied to every internal window. |
+| `frames` | Requested 24-fps duration, aligned upward to `5 + 17*n`; it is not inferred from audio length. |
+| `window_frames` | Maximum H3 window; default/max 362. |
+| `context_frames` | Protected video prefix; default 39. |
+| `video_crossfade_frames` | Pixel-domain seam blend; default 39. |
+| `seed` | One fixed seed reused by every internal window. |
+| `steps`, `sampler_name`, `scheduler` | Sampling controls; defaults 25, `res_multistep`, `simple`. |
+| `shift_video`, `shift_audio` | Native H3 AV flow shifts. |
+| `ref_image_0..8` | Static image references shared by all windows. |
+| `ref_video_0..2` | Reference videos sliced on the absolute timeline. |
+| `ref_audio_0..2` | Reference audios sliced on the absolute timeline. |
+| `ref_video_audio_0..2` | Audio paired with the corresponding reference video. |
 
 ## Outputs
 
-| Output | Type | Description |
-|---|---|---|
-| `samples` | `LATENT` | Stitched H3 AV latent containing generated audio or the fixed-audio latent. |
+| Output | Use |
+|---|---|
+| `samples` | Context-trimmed stitched H3 AV latent, retained for compatibility and inspection. |
+| `images` | Final decoded video with pixel-domain seam crossfades. Use this for the finished movie. |
+| `master_audio` | The original input waveform unchanged. Connect this directly to the final video-combine node. |
+
+Do not decode `samples` for the final movie if you need the explicit pixel
+crossfade. Connect `images` and `master_audio` to VideoHelperSuite or another
+video encoder.
+
+## Timing
+
+H3 video uses the `5 + 17*n` frame grid. With the defaults:
+
+```text
+window 1: frames   0 .. 361
+window 2: frames 323 .. 684
+                    39-frame protected overlap
+```
+
+Master-audio slice endpoints are computed from absolute 24-fps frame positions,
+so independently rounded clip durations cannot accumulate PCM timing drift.
+The final audio output bypasses H3 Audio-VAE decoding and is therefore exactly
+the supplied waveform.
+
+For example, exactly 36 seconds at 24 fps is 864 requested frames. H3 aligns
+that request upward to 872 frames. If strict picture duration matters, trim the
+final encoded video externally; the original master audio itself is never
+time-stretched. When the master audio is shorter than the generated picture,
+the model-conditioning tail is padded with silence, but the AUDIO output still
+retains the original shorter waveform.
+
+## Requirements and memory
+
+- current ComfyUI with official MiniMax H3 nodes and `ModelSamplingAV`;
+- MiniMax H3 Ref2VA model, Video VAE, Audio VAE, and MiniMax CLIP;
+- `torch` and `torchaudio`;
+- batch size 1.
+
+The node keeps generation windowed and moves completed latents to CPU. Its
+`IMAGE` output must still hold the finished RGB movie in system RAM. At high
+resolution or multi-minute duration, a streaming video-writer output would be
+more memory efficient.
+
+The compatibility layer probes the installed ComfyUI first. Native H3 AV-mask
+support is preferred; the bundled GPL compatibility implementation activates
+only when equivalent upstream capabilities are missing. A partially updated
+ComfyUI mask engine is rejected instead of mixing incompatible implementations.
 
 ## Installation
 
-Place this repository under `ComfyUI/custom_nodes`, restart ComfyUI, and search
-for:
+Place this repository in `ComfyUI/custom_nodes`, restart ComfyUI, and add:
 
 ```text
-Minimax H3 Ref Sampler
+Minimax H3 Ref Sampler (Masked Music Video)
 ```
 
-Requirements:
+After upgrading from the previous implementation, restart the whole ComfyUI
+process rather than only refreshing the browser. This clears any old runtime
+patches that may still exist in the current Python process.
 
-- a current ComfyUI build with official MiniMax H3 nodes and `ModelSamplingAV`;
-- MiniMax H3 Ref2VA model, Video VAE, Audio VAE, and MiniMax CLIP;
-- the ComfyUI environment's `torch` and `torchaudio`;
-- batch size 1.
+## License and attribution
 
-## Important behavior
+GPL-3.0. See [LICENSE](LICENSE).
 
-- Final duration is H3-grid aligned and can be up to 16 frames longer than the
-  requested `frames`. A target waveform is cropped or silence-padded in latent
-  space to this timeline.
-- Extremely long stitched AV latents can still consume substantial memory at
-  decode time even though sampling itself is windowed.
-- `ref_image_size=max`, long reference media, and high output resolution can
-  substantially increase memory use.
-- The node expects the official H3 AV layout: video `[B,24,T,H,W]`, audio
-  `[B,32,2,T]`.
-- Do not enable this node's long-video continuity together with Director's
-  continuity or a standalone H3 Motion Context pack in the same ComfyUI
-  process. They patch the same H3 layout/payload entry points; this node detects
-  an existing owner and stops with an explicit error instead of double-wrapping.
-
-## Attribution
-
-The Motion Context helpers and H3 runtime patches are adapted from
-[AIMixer/ComfyUI_MiniMaxH3_Director](https://github.com/AIMixer/ComfyUI_MiniMaxH3_Director),
-licensed under Apache-2.0; modified files retain adaptation notices and this
-repository includes the license text. Director's implementation was informed
-by the community
-[NikoDemon80/ComfyUI-H3-Motion-Context](https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context)
-approach. Fixed-target-audio sampling and its absolute audio timeline are
-implemented in this project.
+The H3 AV-mask compatibility modules are derived from
+[seitanism/ComfyUI-H3-Motion-Context-MultiRef](https://github.com/seitanism/ComfyUI-H3-Motion-Context-MultiRef),
+commit `87de57ba619297503fa49c9594c0c021d5b0c261`, which is a GPL-3.0
+modified fork of NikoDemon80's H3 Motion Context project.
+The single-node internal loop and project-specific orchestration are maintained
+here under the same GPL-3.0 license.
