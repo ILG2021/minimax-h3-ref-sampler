@@ -5,6 +5,7 @@ import torch
 
 import comfy.nested_tensor
 import comfy.samplers
+import comfy.utils
 
 from .music_video import (
     MaskedAVWindowSampler,
@@ -123,8 +124,22 @@ class MinimaxH3RefSampler:
         output_template = None
         previous_sampled = None
         context_t = _video_latent_steps(context_frames)
+        sampling_work = max(1, int(steps))
+        work_per_window = sampling_work + 1
+        total_work = len(windows) * work_per_window
+        progress = comfy.utils.ProgressBar(total_work)
 
-        for start_frame, sample_frames in windows:
+        for window_index, (start_frame, sample_frames) in enumerate(windows):
+            def progress_callback(step, _x0, _x, total_steps):
+                completed = round(
+                    (int(step) + 1) / max(1, int(total_steps)) * sampling_work
+                )
+                progress.update_absolute(
+                    window_index * work_per_window
+                    + min(sampling_work, completed),
+                    total_work,
+                )
+
             ref_videos = {
                 key: _slice_video_window(value, start_frame, sample_frames)
                 for key, value in source_videos.items()
@@ -155,6 +170,7 @@ class MinimaxH3RefSampler:
                 model, positive, prepared,
                 int(seed),
                 steps, sampler_name, scheduler, shift_video, shift_audio,
+                callback=progress_callback,
             )
             window_video, window_audio = _av_parts(sampled)
             decoded = video_vae.decode(window_video)
@@ -181,6 +197,12 @@ class MinimaxH3RefSampler:
             previous_sampled["samples"] = comfy.nested_tensor.NestedTensor((
                 window_video_cpu, window_audio_cpu,
             ))
+            # Reserve one unit per window for VAE decode and seam assembly, so
+            # the frontend reaches 100% only after the window is fully handled.
+            progress.update_absolute(
+                (window_index + 1) * work_per_window,
+                total_work,
+            )
 
         if output_template is None:
             raise RuntimeError("music-video planner produced no windows")

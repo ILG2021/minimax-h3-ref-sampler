@@ -274,7 +274,7 @@ class MaskedAVWindowSampler:
     """Run stock H3 sampling with nested per-stream denoise masks."""
 
     def sample(self, model, positive, latent, seed, steps, sampler_name,
-               scheduler, shift_video, shift_audio):
+               scheduler, shift_video, shift_audio, callback=None):
         sampling = _make_native_av_sampling(model, shift_video, shift_audio)
         sampling_model = _patch_h3_model(
             model, sampling, shift_video, shift_audio
@@ -298,7 +298,7 @@ class MaskedAVWindowSampler:
             comfy.samplers.sampler_object(str(sampler_name)),
             sigmas,
             denoise_mask=latent.get("noise_mask"),
-            callback=None,
+            callback=callback,
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
             seed=int(seed),
         )

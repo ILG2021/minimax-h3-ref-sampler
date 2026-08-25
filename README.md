@@ -56,6 +56,10 @@ Motion Context approach.
 All internal windows reuse the exact same `seed`. There is no hidden
 `seed + window_index` increment.
 
+The node reports one cumulative ComfyUI progress bar across all internal
+windows. Sampling steps and each window's VAE-decode/seam-assembly stage are
+included, so progress does not reset to zero at every segment.
+
 ## Inputs
 
 | Input | Description |
