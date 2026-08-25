@@ -24,7 +24,7 @@ from .music_video import (
 )
 
 
-class MinimaxH3RefSampler:
+class H3TalkingSampler:
     """Generate a long masked-context music video on one master timeline."""
 
     @classmethod
@@ -234,7 +234,7 @@ class MinimaxH3RefSampler:
         return output, images, master_audio
 
 
-NODE_CLASS_MAPPINGS = {"MinimaxH3RefSampler": MinimaxH3RefSampler}
+NODE_CLASS_MAPPINGS = {"H3TalkingSampler": H3TalkingSampler}
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MinimaxH3RefSampler": "Minimax H3 Ref Sampler (Masked Music Video)",
+    "H3TalkingSampler": "H3 Talking Sampler",
 }

@@ -318,8 +318,17 @@ class PixelCrossfadeAssembler:
         self.started = False
 
     def add(self, decoded: torch.Tensor, context_frames: int) -> None:
+        # Video VAEs preserve the batch dimension as [B,T,H,W,C]. ComfyUI's
+        # stock VAEDecode node flattens B and T into the IMAGE frame axis.
+        if decoded.ndim == 5:
+            decoded = decoded.reshape(
+                -1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1]
+            )
         if decoded.ndim != 4 or decoded.shape[0] < 1:
-            raise ValueError("Video VAE decode must return IMAGE [T,H,W,C]")
+            raise ValueError(
+                "Video VAE decode must return [T,H,W,C] or [B,T,H,W,C], "
+                f"got {tuple(decoded.shape)}"
+            )
         decoded = decoded.detach().to(device="cpu", dtype=torch.float32)
         context = max(0, int(context_frames))
         overlap = min(self.overlap, context)

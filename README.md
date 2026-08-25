@@ -1,8 +1,9 @@
-# Minimax H3 Ref Sampler — Masked Music Video
+# H3 Talking Sampler
 
-This ComfyUI custom node turns the MultiRef Music Video train into one internal
-loop. It generates long MiniMax H3 Ref2VA videos against one authoritative
-master soundtrack without manually wiring one sampler group per clip.
+`H3 Talking Sampler` is a ComfyUI node for long-form digital-human and talking
+character generation. It turns the MultiRef Music Video train into one internal
+loop and generates MiniMax H3 Ref2VA video against one authoritative master
+soundtrack without manually wiring one sampler group per clip.
 
 This is an experimental community project, not an official MiniMax or ComfyUI
 component.
@@ -13,7 +14,7 @@ Use the node as the complete generator and connect its finished-media outputs:
 
 ```text
 Load H3 model/CLIP/VAEs ─┐
-Load master audio ───────┼─> Minimax H3 Ref Sampler (Masked Music Video)
+Load master audio ───────┼─> H3 Talking Sampler
 references + prompt ─────┘                         │
                                                    ├─ images ──────┐
                                                    └─ master_audio ┼─> VHS Video Combine
@@ -136,7 +137,7 @@ ComfyUI mask engine is rejected instead of mixing incompatible implementations.
 Place this repository in `ComfyUI/custom_nodes`, restart ComfyUI, and add:
 
 ```text
-Minimax H3 Ref Sampler (Masked Music Video)
+H3 Talking Sampler
 ```
 
 After upgrading from the previous implementation, restart the whole ComfyUI
